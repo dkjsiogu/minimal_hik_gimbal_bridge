@@ -24,6 +24,9 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -43,7 +46,7 @@ void on_signal(int)
 
 struct Options
 {
-  std::string serial_port = "/dev/gimbal";
+  std::string serial_port = "";
   double exposure_ms = 4.0;
   double gain = 8.0;
   int send_interval_ms = 20;
@@ -69,6 +72,10 @@ struct Options
   double bg_blur_sigma = 1.2;
   int center_clear_size = 100;
   bool force_monochrome = false;
+  std::string viewer_ip = "192.168.1.50";
+  int viewer_port = 3335;
+  std::string video_serial = "/dev/ttyUSB0";
+  uint32_t video_serial_baud = 921600;
 };
 
 uint16_t map_legacy_relay_target(uint32_t value)
@@ -116,6 +123,10 @@ void print_help()
     << "  --bg-blur-sigma <f>      静态区域模糊 sigma，默认 1.2\n"
     << "  --center-clear-size <n>  中心保护区边长，默认 100\n"
     << "  --force-monochrome       预处理后强制灰度\n"
+    << "  --viewer-ip <ip>         PV31 UDP 目标 IP，默认 192.168.1.50\n"
+    << "  --viewer-port <n>        PV31 UDP 目标端口，默认 3335\n"
+    << "  --video-serial <path>    图传TX串口路径，默认 /dev/ttyUSB0\n"
+    << "  --video-serial-baud <n>  图传TX串口波特率，默认 921600\n"
     << "  --help                   显示帮助\n";
 }
 
@@ -193,6 +204,14 @@ Options parse_args(int argc, char ** argv)
       options.center_clear_size = static_cast<int>(parse_u32(require_value("--center-clear-size")));
     } else if (arg == "--force-monochrome") {
       options.force_monochrome = true;
+    } else if (arg == "--viewer-ip") {
+      options.viewer_ip = require_value("--viewer-ip");
+    } else if (arg == "--viewer-port") {
+      options.viewer_port = static_cast<int>(parse_u32(require_value("--viewer-port")));
+    } else if (arg == "--video-serial") {
+      options.video_serial = require_value("--video-serial");
+    } else if (arg == "--video-serial-baud") {
+      options.video_serial_baud = parse_u32(require_value("--video-serial-baud"));
     } else if (arg == "--help" || arg == "-h") {
       print_help();
       std::exit(0);
@@ -210,12 +229,16 @@ public:
   SerialPort() = default;
   ~SerialPort() { close(); }
 
-  void open_or_throw(const std::string & port)
+  void open_or_throw(const std::string & port, uint32_t baud_rate = 0)
   {
     close();
 
     serial_ = std::make_unique<serial::Serial>();
     serial_->setPort(port);
+
+    if (baud_rate > 0) {
+      serial_->setBaudrate(baud_rate);
+    }
 
     if (!serial_->isOpen()) {
       serial_->open();
@@ -259,6 +282,64 @@ private:
   }
 
   std::unique_ptr<serial::Serial> serial_;
+};
+
+class UdpSender
+{
+public:
+  UdpSender() = default;
+  ~UdpSender() { close(); }
+
+  bool open(const std::string & ip, int port)
+  {
+    close();
+    fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd_ < 0) {
+      std::cerr << "[udp-0310] socket() failed: " << std::strerror(errno) << std::endl;
+      return false;
+    }
+    std::memset(&dest_, 0, sizeof(dest_));
+    dest_.sin_family = AF_INET;
+    dest_.sin_port = htons(static_cast<uint16_t>(port));
+    if (::inet_pton(AF_INET, ip.c_str(), &dest_.sin_addr) != 1) {
+      std::cerr << "[udp-0310] inet_pton(" << ip << ") failed" << std::endl;
+      close();
+      return false;
+    }
+    dest_ip_ = ip;
+    dest_port_ = port;
+    return true;
+  }
+
+  void close()
+  {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  bool send(const uint8_t * data, std::size_t size)
+  {
+    if (fd_ < 0) { return false; }
+    const auto sent = ::sendto(
+      fd_, data, size, 0,
+      reinterpret_cast<const sockaddr *>(&dest_),
+      sizeof(dest_));
+    if (sent != static_cast<ssize_t>(size)) {
+      std::cerr << "[udp-0310] sendto " << dest_ip_ << ":" << dest_port_
+                << " failed, sent=" << sent << " expected=" << size
+                << " errno=" << std::strerror(errno) << std::endl;
+      return false;
+    }
+    return true;
+  }
+
+private:
+  int fd_ = -1;
+  sockaddr_in dest_{};
+  std::string dest_ip_;
+  int dest_port_ = 0;
 };
 
 struct FrameInfo
@@ -978,13 +1059,37 @@ int main(int argc, char ** argv)
     camera.open_first(options.exposure_ms, options.gain);
     std::cout << "[bridge] Hik camera ready." << std::endl;
 
-    std::cout << "[bridge] opening serial " << options.serial_port << std::endl;
     SerialPort serial;
-    serial.open_or_throw(options.serial_port);
-    std::cout << "[bridge] serial ready." << std::endl;
-
     SharedGimbalState gimbal_state;
-    receiver = std::thread([&serial, &gimbal_state] { rx_loop(serial, gimbal_state); });
+    if (!options.serial_port.empty()) {
+      std::cout << "[bridge] opening serial " << options.serial_port << std::endl;
+      serial.open_or_throw(options.serial_port);
+      std::cout << "[bridge] serial ready." << std::endl;
+      receiver = std::thread([&serial, &gimbal_state] { rx_loop(serial, gimbal_state); });
+    } else {
+      std::cout << "[bridge] no gimbal serial, skipping." << std::endl;
+    }
+
+    UdpSender viewer_udp;
+    if (use_0310_video && !options.viewer_ip.empty()) {
+      if (viewer_udp.open(options.viewer_ip, options.viewer_port)) {
+        std::cout << "[bridge] PV31 UDP target: " << options.viewer_ip << ":" << options.viewer_port << std::endl;
+      } else {
+        std::cerr << "[bridge] WARNING: PV31 UDP not available, video will only go via serial" << std::endl;
+      }
+    }
+
+    SerialPort video_serial;
+    if (use_0310_video && !options.video_serial.empty()) {
+      try {
+        video_serial.open_or_throw(options.video_serial, options.video_serial_baud);
+        std::cout << "[bridge] PV31 video serial TX: " << options.video_serial
+                  << " baud=" << options.video_serial_baud << std::endl;
+      } catch (const std::exception & error) {
+        std::cerr << "[bridge] WARNING: cannot open video serial " << options.video_serial
+                  << ": " << error.what() << std::endl;
+      }
+    }
 
     FrameInfo latest_frame{};
     FramePreprocessor preprocessor(options);
@@ -999,6 +1104,8 @@ int main(int argc, char ** argv)
     auto last_send = Clock::now();
     auto last_report = Clock::now();
     auto fps_window = Clock::now();
+
+    uint8_t video_serial_seq = 0;
 
     std::cout << "[bridge] preprocess crop=" << options.crop_size
           << " output=" << preprocessor.output_size() << 'x' << preprocessor.output_size()
@@ -1096,7 +1203,30 @@ int main(int argc, char ** argv)
 
         if (packet_ready) {
           bridge::protocol::finalize_crc16(packet);
-          serial.write_all(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+          if (!options.serial_port.empty()) {
+            serial.write_all(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+          }
+          if (use_0310_video && packet.relay_data_length > 0) {
+            try {
+              uint8_t ref_frame[320];
+              std::size_t ref_len = 0;
+              bridge::protocol::build_referee_frame(
+                ref_frame, ref_len,
+                packet.referee_cmd_id,
+                video_serial_seq++,
+                packet.relay_data,
+                packet.relay_data_length);
+              video_serial.write_all(ref_frame, ref_len);
+            } catch (const std::exception & error) {
+              static auto last_serial_err = Clock::now();
+              const auto now_err = Clock::now();
+              if (now_err - last_serial_err >= std::chrono::seconds(5)) {
+                std::cerr << "[video-serial] write error: " << error.what() << std::endl;
+                last_serial_err = now_err;
+              }
+            }
+            viewer_udp.send(packet.relay_data, packet.relay_data_length);
+          }
           ++sent_packets;
           last_send = now;
         }

@@ -128,6 +128,24 @@ static_assert(sizeof(CustomClientVideo0310Chunk) == sizeof(RefereeCustomClient03
 static_assert(sizeof(VehicleTelemetryV1) <= sizeof(RefereeCustomClient0310), "VehicleTelemetryV1 too large");
 static_assert(sizeof(VisionToGimbalRelay) == 333, "Unexpected VisionToGimbalRelay size");
 
+inline constexpr uint8_t kRefereeSof = 0xA5U;
+
+inline uint8_t crc8(const uint8_t * data, std::size_t len)
+{
+  uint8_t crc = 0xFFU;
+  while (len-- != 0U) {
+    crc ^= *data++;
+    for (int i = 0; i < 8; ++i) {
+      if ((crc & 0x80U) != 0U) {
+        crc = static_cast<uint8_t>((crc << 1U) ^ 0x31U);
+      } else {
+        crc = static_cast<uint8_t>(crc << 1U);
+      }
+    }
+  }
+  return crc;
+}
+
 inline constexpr uint16_t kCrc16Init = 0xFFFF;
 inline constexpr std::array<uint16_t, 256> kCrc16Table = {
   0x0000, 0x1189, 0x2312, 0x329B, 0x4624, 0x57AD, 0x6536, 0x74BF, 0x8C48, 0x9DC1, 0xAF5A,
@@ -164,6 +182,32 @@ inline uint16_t crc16(const uint8_t * data, uint32_t len)
     crc = static_cast<uint16_t>((crc >> 8U) ^ kCrc16Table[index]);
   }
   return crc;
+}
+
+inline void build_referee_frame(
+  uint8_t * frame,
+  std::size_t & frame_len,
+  uint16_t cmd_id,
+  uint8_t seq,
+  const uint8_t * data,
+  std::size_t data_len)
+{
+  const uint16_t payload_len = static_cast<uint16_t>(sizeof(cmd_id) + data_len);
+  frame[0] = kRefereeSof;
+  frame[1] = static_cast<uint8_t>(payload_len & 0xFFU);
+  frame[2] = static_cast<uint8_t>((payload_len >> 8U) & 0xFFU);
+  frame[3] = seq;
+  frame[4] = crc8(frame, 4U);
+
+  std::memcpy(&frame[5], &cmd_id, sizeof(cmd_id));
+  std::memcpy(&frame[7], data, data_len);
+
+  const std::size_t crc16_offset = 7U + data_len;
+  const auto crc16_val = crc16(&frame[5], payload_len);
+  frame[crc16_offset] = static_cast<uint8_t>(crc16_val & 0xFFU);
+  frame[crc16_offset + 1U] = static_cast<uint8_t>((crc16_val >> 8U) & 0xFFU);
+
+  frame_len = crc16_offset + 2U;
 }
 
 inline uint16_t checksum16(const uint8_t * data, std::size_t len)
