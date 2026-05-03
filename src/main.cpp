@@ -1,5 +1,7 @@
 #include "protocol.hpp"
 
+#include "serial/serial.h"
+
 #include <MvCameraControl.h>
 #include <PixelType.h>
 #include <opencv2/opencv.hpp>
@@ -15,13 +17,13 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <termios.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -41,8 +43,7 @@ void on_signal(int)
 
 struct Options
 {
-  std::string serial_port = "/dev/ttyUSB0";
-  int baud_rate = 921600;
+  std::string serial_port = "/dev/gimbal";
   double exposure_ms = 4.0;
   double gain = 8.0;
   int send_interval_ms = 20;
@@ -88,8 +89,7 @@ void print_help()
 {
   std::cout
     << "minimal_hik_gimbal_bridge\n"
-    << "  --serial <path>          串口路径，默认 /dev/ttyUSB0\n"
-    << "  --baud <rate>            波特率，默认 921600\n"
+    << "  --serial <path>          串口路径，默认 /dev/gimbal\n"
     << "  --exposure-ms <value>    海康曝光时间，默认 4.0 ms\n"
     << "  --gain <value>           海康增益，默认 8.0\n"
     << "  --send-interval-ms <n>   串口发送周期，默认 20 ms，对应 0x0310 50Hz\n"
@@ -140,7 +140,7 @@ Options parse_args(int argc, char ** argv)
     if (arg == "--serial") {
       options.serial_port = require_value("--serial");
     } else if (arg == "--baud") {
-      options.baud_rate = static_cast<int>(parse_u32(require_value("--baud")));
+      throw std::runtime_error("--baud 已移除，当前直接使用 serial 库默认串口配置");
     } else if (arg == "--exposure-ms") {
       options.exposure_ms = std::stod(require_value("--exposure-ms"));
     } else if (arg == "--gain") {
@@ -210,91 +210,55 @@ public:
   SerialPort() = default;
   ~SerialPort() { close(); }
 
-  void open_or_throw(const std::string & port, int baud_rate)
+  void open_or_throw(const std::string & port)
   {
-    fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd_ < 0) {
-      throw std::runtime_error("打开串口失败: " + port + " - " + std::strerror(errno));
-    }
+    close();
 
-    termios tty{};
-    if (tcgetattr(fd_, &tty) != 0) {
-      throw std::runtime_error("读取串口属性失败: " + std::string(std::strerror(errno)));
-    }
+    serial_ = std::make_unique<serial::Serial>();
+    serial_->setPort(port);
 
-    cfmakeraw(&tty);
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CRTSCTS;
-    tty.c_cflag &= ~PARENB;
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 0;
-
-    const auto baud = to_speed(baud_rate);
-    cfsetispeed(&tty, baud);
-    cfsetospeed(&tty, baud);
-
-    if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
-      throw std::runtime_error("设置串口属性失败: " + std::string(std::strerror(errno)));
-    }
-
-    if (tcflush(fd_, TCIOFLUSH) != 0) {
-      throw std::runtime_error("清空串口缓冲区失败: " + std::string(std::strerror(errno)));
+    if (!serial_->isOpen()) {
+      serial_->open();
     }
   }
 
   void close()
   {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
+    if (serial_ != nullptr) {
+      if (serial_->isOpen()) {
+        serial_->close();
+      }
+      serial_.reset();
     }
   }
 
   void write_all(const uint8_t * data, std::size_t size)
   {
-    std::size_t offset = 0;
-    while (offset < size) {
-      const auto written = ::write(fd_, data + offset, size - offset);
-      if (written > 0) {
-        offset += static_cast<std::size_t>(written);
-        continue;
+    ensure_open();
+    const auto written = serial_->write(data, size);
+    if (written != size) {
+      if (written == 0) {
+        throw std::runtime_error("串口写超时");
       }
-
-      if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-
-      throw std::runtime_error("串口写失败: " + std::string(std::strerror(errno)));
+      throw std::runtime_error("串口写失败: 仅发送 " + std::to_string(written) + "/" + std::to_string(size) + " 字节");
     }
   }
 
-  ssize_t read_some(uint8_t * buffer, std::size_t size)
+  bool read_exact(uint8_t * buffer, std::size_t size)
   {
-    return ::read(fd_, buffer, size);
+    ensure_open();
+    return serial_->read(buffer, size) == size;
   }
 
 private:
-  static speed_t to_speed(int baud_rate)
+  void ensure_open() const
   {
-    switch (baud_rate) {
-      case 115200:
-        return B115200;
-      case 921600:
-        return B921600;
-      case 460800:
-        return B460800;
-      case 230400:
-        return B230400;
-      default:
-        throw std::runtime_error("当前最小工程只支持 115200/230400/460800/921600 波特率");
+    if (serial_ == nullptr || !serial_->isOpen()) {
+      throw std::runtime_error("串口尚未打开");
     }
   }
 
-  int fd_ = -1;
+  std::unique_ptr<serial::Serial> serial_;
 };
 
 struct FrameInfo
@@ -949,39 +913,26 @@ void fill_relay_data(
 
 void rx_loop(SerialPort & serial, SharedGimbalState & gimbal_state)
 {
-  static constexpr std::array<uint8_t, 2> kPacketHead = {'S', 'P'};
-  std::vector<uint8_t> buffer;
-  buffer.reserve(512);
-  std::array<uint8_t, 128> chunk{};
   auto last_log = Clock::now();
 
   while (g_running.load()) {
-    const auto n = serial.read_some(chunk.data(), chunk.size());
-    if (n > 0) {
-      buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + n);
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-
-    while (buffer.size() >= sizeof(bridge::protocol::GimbalToVision)) {
-      auto head = std::search(buffer.begin(), buffer.end(), kPacketHead.begin(), kPacketHead.end());
-      if (head == buffer.end()) {
-        buffer.clear();
-        break;
-      }
-
-      if (head != buffer.begin()) {
-        buffer.erase(buffer.begin(), head);
-      }
-
-      if (buffer.size() < sizeof(bridge::protocol::GimbalToVision)) {
-        break;
-      }
-
+    try {
       bridge::protocol::GimbalToVision packet{};
-      std::memcpy(&packet, buffer.data(), sizeof(packet));
+      if (!serial.read_exact(packet.head, sizeof(packet.head))) {
+        continue;
+      }
+
+      if (packet.head[0] != 'S' || packet.head[1] != 'P') {
+        continue;
+      }
+
+      if (!serial.read_exact(
+            reinterpret_cast<uint8_t *>(&packet) + sizeof(packet.head),
+            sizeof(packet) - sizeof(packet.head))) {
+        continue;
+      }
+
       if (!bridge::protocol::check_crc16(packet)) {
-        buffer.erase(buffer.begin());
         continue;
       }
 
@@ -1000,8 +951,9 @@ void rx_loop(SerialPort & serial, SharedGimbalState & gimbal_state)
                   << " bullet_count=" << packet.bullet_count << std::endl;
         last_log = now;
       }
-
-      buffer.erase(buffer.begin(), buffer.begin() + static_cast<long>(sizeof(packet)));
+    } catch (const std::exception & error) {
+      std::cerr << "[gimbal-rx] serial error: " << error.what() << std::endl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   }
 }
@@ -1009,6 +961,8 @@ void rx_loop(SerialPort & serial, SharedGimbalState & gimbal_state)
 
 int main(int argc, char ** argv)
 {
+  std::thread receiver;
+
   try {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -1024,13 +978,13 @@ int main(int argc, char ** argv)
     camera.open_first(options.exposure_ms, options.gain);
     std::cout << "[bridge] Hik camera ready." << std::endl;
 
-    std::cout << "[bridge] opening serial " << options.serial_port << " @ " << options.baud_rate << std::endl;
+    std::cout << "[bridge] opening serial " << options.serial_port << std::endl;
     SerialPort serial;
-    serial.open_or_throw(options.serial_port, options.baud_rate);
+    serial.open_or_throw(options.serial_port);
     std::cout << "[bridge] serial ready." << std::endl;
 
     SharedGimbalState gimbal_state;
-    std::thread receiver([&serial, &gimbal_state] { rx_loop(serial, gimbal_state); });
+    receiver = std::thread([&serial, &gimbal_state] { rx_loop(serial, gimbal_state); });
 
     FrameInfo latest_frame{};
     FramePreprocessor preprocessor(options);
@@ -1164,9 +1118,16 @@ int main(int argc, char ** argv)
       }
     }
 
-    receiver.join();
+    g_running = false;
+    if (receiver.joinable()) {
+      receiver.join();
+    }
     return 0;
   } catch (const std::exception & error) {
+    g_running = false;
+    if (receiver.joinable()) {
+      receiver.join();
+    }
     std::cerr << "[bridge] fatal: " << error.what() << std::endl;
     return 1;
   }
