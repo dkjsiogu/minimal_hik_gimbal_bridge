@@ -12,6 +12,8 @@ TARGET_BIN="$BIN_DIR/minimal_hik_gimbal_bridge"
 TARGET_LAUNCHER="$BIN_DIR/minimal-hik-gimbal-bridge-run"
 TEMPLATE="$PROJECT_DIR/deploy/autostart/minimal-hik-gimbal-bridge.desktop.in"
 AUTOSTART_DELAY="${RM_BRIDGE_STARTUP_DELAY:-5}"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/bridge-autostart.log"
 SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
@@ -27,6 +29,7 @@ while [[ $# -gt 0 ]]; do
   - 如有需要自动构建 bridge
   - 复制 bridge 二进制和启动脚本到 bin/
   - 安装桌面自启动项 RoboMaster Hik Bridge
+  - 开机自启日志写到 logs/bridge-autostart.log
 
 默认会自动构建；如果你已经手动编译过，可加 --skip-build。
 EOF
@@ -57,6 +60,7 @@ if [[ ! -f "$SOURCE_LAUNCHER" ]]; then
 fi
 
 mkdir -p "$BIN_DIR" "$AUTOSTART_DIR"
+mkdir -p "$LOG_DIR"
 cp "$SOURCE_BIN" "$TARGET_BIN"
 cp "$SOURCE_LAUNCHER" "$TARGET_LAUNCHER"
 chmod +x "$TARGET_BIN"
@@ -67,7 +71,7 @@ rm -f \
   "$AUTOSTART_DIR/rm-hik-bridge.desktop"
 
 DESKTOP_FILE="$AUTOSTART_DIR/minimal-hik-gimbal-bridge.desktop"
-EXEC_LINE="env RM_BRIDGE_STARTUP_DELAY=${AUTOSTART_DELAY} $TARGET_LAUNCHER"
+EXEC_LINE="env RM_BRIDGE_STARTUP_DELAY=${AUTOSTART_DELAY} RM_BRIDGE_LOG_TO_FILE=1 RM_BRIDGE_LOG_PATH=${LOG_FILE} $TARGET_LAUNCHER"
 
 sed \
   -e "s|%APP_NAME%|RoboMaster Hik Bridge|g" \
@@ -81,3 +85,4 @@ chmod 644 "$DESKTOP_FILE"
 
 echo "已安装 Startup 项: $DESKTOP_FILE"
 echo "  启动命令: $EXEC_LINE"
+echo "  日志文件: $LOG_FILE"

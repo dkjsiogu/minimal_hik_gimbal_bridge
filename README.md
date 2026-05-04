@@ -172,11 +172,18 @@ LD_LIBRARY_PATH=/opt/MVS/bin:/opt/MVS/lib/64 ./build/minimal_hik_gimbal_bridge
 ```
 
 这个脚本会自动构建 bridge，然后在当前仓库下生成 `bin/` 并安装桌面自启动项 `RoboMaster Hik Bridge`。
+开机自启日志默认写到：`logs/bridge-autostart.log`。
 
 如果你已经手动编译过，可以跳过构建：
 
 ```bash
 ./scripts/install-autostart.sh --skip-build
+```
+
+查看车载端开机自启日志：
+
+```bash
+tail -f logs/bridge-autostart.log
 ```
 
 兼容旧参数：
