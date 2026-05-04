@@ -106,10 +106,10 @@ build/minimal_hik_gimbal_bridge
 
 - 中心正方形裁剪
 - 固定边长缩放到 `video_size`
-- 静态区域简化
+- 中心 ROI 保真，默认 `170x170`
+- 外围静态区域灰度化、降纹理、模糊和时域稳定
 - 运动区域保真
 - 历史帧拖影叠加
-- 中心保护区不过度模糊
 - 后级轻量降噪与颜色压缩优化
 
 ### `PV31` 格式
@@ -225,8 +225,8 @@ tail -f logs/bridge-autostart.log
 - `--motion-trail-frames <n>`：拖影历史帧数，默认 `30`
 - `--trail-disable-motion-ratio <f>`：全局运动比例过高时禁用拖影
 - `--bg-update-alpha <f>`：背景更新速度
-- `--bg-blur-sigma <f>`：静态区域模糊强度
-- `--center-clear-size <n>`：中心保护区边长
+- `--bg-blur-sigma <f>`：静态区域模糊强度，默认 `1.9`
+- `--center-clear-size <n>`：中心保真区边长，默认 `170`
 - `--force-monochrome`：强制灰度
 - `--viewer-ip <ip>`：打开本地 PV31 UDP 调试输出，正常官方链路不需要
 

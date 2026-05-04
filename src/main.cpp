@@ -47,8 +47,8 @@ void on_signal(int)
 struct Options
 {
   std::string serial_port = "";
-  double exposure_ms = 4.0;
-  double gain = 8.0;
+  double exposure_ms = 10.0;
+  double gain = 12.0;
   int send_interval_ms = 20;
   uint8_t mode = 0;
   uint16_t sender_id = 0;
@@ -66,12 +66,13 @@ struct Options
   int motion_threshold = 14;
   int motion_erode_px = 2;
   int motion_dilate_px = 6;
-  int motion_trail_frames = 30;
-  double trail_disable_motion_ratio = 0.30;
+  int motion_trail_frames = 8;
+  double trail_disable_motion_ratio = 0.55;
   double bg_update_alpha = 0.01;
-  double bg_blur_sigma = 1.2;
-  int center_clear_size = 100;
+  double bg_blur_sigma = 1.5;
+  int center_clear_size = 180;
   bool force_monochrome = false;
+  bool test_pattern = false;
   std::string viewer_ip = "";
   int viewer_port = 3335;
   std::string video_serial = "/dev/ttyUSB0";
@@ -97,8 +98,8 @@ void print_help()
   std::cout
     << "minimal_hik_gimbal_bridge\n"
     << "  --serial <path>          串口路径，默认 /dev/gimbal\n"
-    << "  --exposure-ms <value>    海康曝光时间，默认 4.0 ms\n"
-    << "  --gain <value>           海康增益，默认 8.0\n"
+    << "  --exposure-ms <value>    海康曝光时间，默认 10.0 ms\n"
+    << "  --gain <value>           海康增益，默认 12.0\n"
     << "  --send-interval-ms <n>   串口发送周期，默认 20 ms，对应 0x0310 50Hz\n"
     << "  --mode <0|1|2>           输出 mode，默认 0\n"
     << "  --sender-id <n>          裁判系统 sender_id，默认 0\n"
@@ -113,16 +114,18 @@ void print_help()
     << "  --video-bitrate-kbps <n> 0310 视频目标码率，默认 80 kbit/s\n"
     << "  --video-gop <n>          H264 GOP，默认 30\n"
     << "  --crop-size <n>          预处理中心裁剪边长，0 表示自动取最小边\n"
-    << "  --no-static-simplify     关闭静态区域简化和拖影预处理\n"
+    << "  --static-simplify        开启静态区域简化预处理，默认开启\n"
+    << "  --no-static-simplify     显式关闭静态区域简化预处理\n"
     << "  --motion-threshold <n>   运动检测阈值，默认 14\n"
     << "  --motion-erode-px <n>    运动掩码腐蚀像素，默认 2\n"
     << "  --motion-dilate-px <n>   运动掩码膨胀像素，默认 6\n"
-    << "  --motion-trail-frames <n>拖影历史帧数，默认 30\n"
-    << "  --trail-disable-motion-ratio <f> 全局运动占比超阈值时禁用拖影，默认 0.30\n"
+    << "  --motion-trail-frames <n>拖影历史帧数，默认 8\n"
+    << "  --trail-disable-motion-ratio <f> 全局运动占比超阈值时禁用拖影，默认 0.55\n"
     << "  --bg-update-alpha <f>    背景更新 alpha，默认 0.01\n"
-    << "  --bg-blur-sigma <f>      静态区域模糊 sigma，默认 1.2\n"
-    << "  --center-clear-size <n>  中心保护区边长，默认 100\n"
+    << "  --bg-blur-sigma <f>      静态区域模糊 sigma，默认 1.5\n"
+    << "  --center-clear-size <n>  中心保护区边长，默认 180\n"
     << "  --force-monochrome       预处理后强制灰度\n"
+    << "  --test-pattern           无相机时使用内置测试图案源\n"
     << "  --viewer-ip <ip>         可选 PV31 UDP 调试目标 IP，默认关闭\n"
     << "  --viewer-port <n>        PV31 UDP 目标端口，默认 3335\n"
     << "  --video-serial <path>    图传TX串口路径，默认 /dev/ttyUSB0\n"
@@ -184,6 +187,8 @@ Options parse_args(int argc, char ** argv)
       options.video_gop = static_cast<int>(parse_u32(require_value("--video-gop")));
     } else if (arg == "--crop-size") {
       options.crop_size = static_cast<int>(parse_u32(require_value("--crop-size")));
+    } else if (arg == "--static-simplify") {
+      options.static_simplify = true;
     } else if (arg == "--no-static-simplify") {
       options.static_simplify = false;
     } else if (arg == "--motion-threshold") {
@@ -204,6 +209,8 @@ Options parse_args(int argc, char ** argv)
       options.center_clear_size = static_cast<int>(parse_u32(require_value("--center-clear-size")));
     } else if (arg == "--force-monochrome") {
       options.force_monochrome = true;
+    } else if (arg == "--test-pattern") {
+      options.test_pattern = true;
     } else if (arg == "--viewer-ip") {
       options.viewer_ip = require_value("--viewer-ip");
     } else if (arg == "--viewer-port") {
@@ -351,6 +358,65 @@ struct FrameInfo
   Clock::time_point timestamp{};
   std::vector<uint8_t> rgb24;
 };
+
+FrameInfo make_test_pattern_frame(uint32_t sequence, Clock::time_point timestamp)
+{
+  constexpr int width = 1440;
+  constexpr int height = 1080;
+
+  cv::Mat frame(height, width, CV_8UC3, cv::Scalar(10, 14, 10));
+  const cv::Scalar grid_color(26, 34, 26);
+  for (int x = 0; x < width; x += 80) {
+    cv::line(frame, cv::Point(x, 0), cv::Point(x, height - 1), grid_color, 1, cv::LINE_AA);
+  }
+  for (int y = 0; y < height; y += 80) {
+    cv::line(frame, cv::Point(0, y), cv::Point(width - 1, y), grid_color, 1, cv::LINE_AA);
+  }
+
+  const cv::Point center(width / 2, height / 2);
+  const cv::Rect roi(center.x - 210, center.y - 210, 420, 420);
+  cv::rectangle(frame, roi, cv::Scalar(30, 48, 30), cv::FILLED);
+  cv::rectangle(frame, roi, cv::Scalar(120, 190, 120), 2, cv::LINE_AA);
+  for (int offset = 30; offset < roi.width; offset += 30) {
+    cv::line(frame,
+             cv::Point(roi.x + offset, roi.y),
+             cv::Point(roi.x + offset, roi.y + roi.height),
+             cv::Scalar(75, 115, 75),
+             1,
+             cv::LINE_AA);
+    cv::line(frame,
+             cv::Point(roi.x, roi.y + offset),
+             cv::Point(roi.x + roi.width, roi.y + offset),
+             cv::Scalar(75, 115, 75),
+             1,
+             cv::LINE_AA);
+  }
+  cv::circle(frame, center, 120, cv::Scalar(180, 220, 180), 2, cv::LINE_AA);
+  cv::circle(frame, center, 70, cv::Scalar(210, 240, 210), 2, cv::LINE_AA);
+  cv::line(frame, cv::Point(center.x - 150, center.y), cv::Point(center.x + 150, center.y), cv::Scalar(240, 255, 240), 2, cv::LINE_AA);
+  cv::line(frame, cv::Point(center.x, center.y - 150), cv::Point(center.x, center.y + 150), cv::Scalar(240, 255, 240), 2, cv::LINE_AA);
+  cv::putText(frame, "ROI", cv::Point(roi.x + 130, roi.y + 205), cv::FONT_HERSHEY_SIMPLEX, 1.4, cv::Scalar(235, 255, 235), 3, cv::LINE_AA);
+  cv::putText(frame, std::to_string(sequence % 1000), cv::Point(roi.x + 145, roi.y + 255), cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(235, 255, 235), 2, cv::LINE_AA);
+
+  const int projectile_phase = static_cast<int>((sequence * 18U) % 360U);
+  const int projectile_x = roi.x + 30 + projectile_phase;
+  const int projectile_y = center.y - 90 + static_cast<int>((sequence * 7U) % 180U);
+  cv::circle(frame, cv::Point(projectile_x, projectile_y), 14, cv::Scalar(240, 245, 255), cv::FILLED, cv::LINE_AA);
+  cv::circle(frame, cv::Point(projectile_x, projectile_y), 26, cv::Scalar(90, 150, 255), 2, cv::LINE_AA);
+
+  const int target_x = 160 + static_cast<int>((sequence * 9U) % 640U);
+  cv::rectangle(frame, cv::Rect(target_x, 760, 120, 150), cv::Scalar(60, 90, 210), cv::FILLED);
+  cv::rectangle(frame, cv::Rect(target_x + 25, 700, 70, 70), cv::Scalar(120, 170, 255), cv::FILLED);
+
+  FrameInfo result;
+  result.width = static_cast<uint16_t>(width);
+  result.height = static_cast<uint16_t>(height);
+  result.sequence = sequence;
+  result.timestamp = timestamp;
+  result.bytes = static_cast<uint32_t>(frame.total() * frame.elemSize());
+  result.rgb24.assign(frame.datastart, frame.dataend);
+  return result;
+}
 
 struct SharedGimbalState
 {
@@ -827,31 +893,32 @@ public:
       : 0.0;
     const bool suppress_trail = motion_ratio >= trail_disable_motion_ratio_;
 
+    cv::Mat focus_mask = motion_mask.clone();
     if (center_clear_size_ > 0) {
       const int clear_size = std::min({center_clear_size_, working.cols, working.rows});
       const int clear_x = std::max(0, working.cols / 2 - clear_size / 2);
       const int clear_y = std::max(0, working.rows / 2 - clear_size / 2);
       const int clear_w = std::min(clear_size, working.cols - clear_x);
       const int clear_h = std::min(clear_size, working.rows - clear_y);
-      cv::rectangle(motion_mask, cv::Rect(clear_x, clear_y, clear_w, clear_h), cv::Scalar(255), cv::FILLED);
+      cv::rectangle(focus_mask, cv::Rect(clear_x, clear_y, clear_w, clear_h), cv::Scalar(255), cv::FILLED);
     }
 
     cv::Mat static_base = working.clone();
-    if (!force_monochrome_ && target_bitrate_kbps_ <= 80) {
-      cv::Mat gray_static;
-      cv::cvtColor(static_base, gray_static, cv::COLOR_BGR2GRAY);
-      cv::cvtColor(gray_static, static_base, cv::COLOR_GRAY2BGR);
-    }
+
+    cv::Mat detail_blur;
+    cv::Mat detailed_focus;
+    cv::GaussianBlur(working, detail_blur, cv::Size(), 0.85, 0.85);
+    cv::addWeighted(working, 1.45, detail_blur, -0.45, 0.0, detailed_focus);
 
     cv::Mat blurred_static;
     cv::GaussianBlur(static_base, blurred_static, cv::Size(), bg_blur_sigma_, bg_blur_sigma_);
 
     cv::Mat focused = blurred_static.clone();
-    working.copyTo(focused, motion_mask);
+    detailed_focus.copyTo(focused, focus_mask);
 
     if (motion_trail_frames_ > 0) {
       motion_mask_history_.push_back(motion_mask.clone());
-      trail_frame_history_.push_back(working.clone());
+      trail_frame_history_.push_back(detailed_focus.clone());
       const auto max_history = static_cast<std::size_t>(motion_trail_frames_ + 1);
       while (motion_mask_history_.size() > max_history) {
         motion_mask_history_.pop_front();
@@ -863,7 +930,7 @@ public:
       const auto history_size = motion_mask_history_.size();
       if (!suppress_trail && history_size > 1 && history_size == trail_frame_history_.size()) {
         cv::Mat trail_mask = motion_mask.clone();
-        cv::Mat trail_img = working.clone();
+        cv::Mat trail_img = detailed_focus.clone();
         for (std::size_t i = 0; i + 1 < history_size; ++i) {
           cv::bitwise_or(trail_mask, motion_mask_history_[i], trail_mask);
           cv::max(trail_img, trail_frame_history_[i], trail_img);
@@ -896,11 +963,11 @@ private:
   int motion_threshold_ = 14;
   int motion_erode_px_ = 2;
   int motion_dilate_px_ = 6;
-  int motion_trail_frames_ = 30;
-  double trail_disable_motion_ratio_ = 0.30;
+  int motion_trail_frames_ = 8;
+  double trail_disable_motion_ratio_ = 0.55;
   double bg_update_alpha_ = 0.01;
-  double bg_blur_sigma_ = 1.2;
-  int center_clear_size_ = 100;
+  double bg_blur_sigma_ = 1.5;
+  int center_clear_size_ = 180;
   bool force_monochrome_ = false;
   cv::Mat background_gray_f32_;
   cv::Mat motion_erode_kernel_;
@@ -1059,10 +1126,14 @@ int main(int argc, char ** argv)
       options.video_0310 &&
       options.referee_cmd_id == static_cast<uint16_t>(bridge::protocol::RelayCommandId::CustomClient0310);
 
-    std::cout << "[bridge] opening Hik camera..." << std::endl;
     HikCamera camera;
-    camera.open_first(options.exposure_ms, options.gain);
-    std::cout << "[bridge] Hik camera ready." << std::endl;
+    if (options.test_pattern) {
+      std::cout << "[bridge] using built-in test pattern source." << std::endl;
+    } else {
+      std::cout << "[bridge] opening Hik camera..." << std::endl;
+      camera.open_first(options.exposure_ms, options.gain);
+      std::cout << "[bridge] Hik camera ready." << std::endl;
+    }
 
     SerialPort serial;
     SharedGimbalState gimbal_state;
@@ -1109,6 +1180,8 @@ int main(int argc, char ** argv)
     auto last_send = Clock::now();
     auto last_report = Clock::now();
     auto fps_window = Clock::now();
+    auto last_test_frame = Clock::time_point{};
+    uint32_t test_pattern_sequence = 0;
 
     uint8_t video_serial_seq = 0;
 
@@ -1124,7 +1197,20 @@ int main(int argc, char ** argv)
     while (g_running.load()) {
       const auto now = Clock::now();
       FrameInfo frame{};
-      if (camera.grab(frame, 50, use_0310_video)) {
+      bool have_frame = false;
+      if (options.test_pattern) {
+        const auto test_frame_interval = std::chrono::milliseconds(
+          std::max(1, 1000 / std::clamp(options.video_fps, 1, 120)));
+        if (last_test_frame == Clock::time_point{} || now - last_test_frame >= test_frame_interval) {
+          frame = make_test_pattern_frame(test_pattern_sequence++, now);
+          last_test_frame = now;
+          have_frame = true;
+        }
+      } else if (camera.grab(frame, 50, use_0310_video)) {
+        have_frame = true;
+      }
+
+      if (have_frame) {
         latest_frame = frame;
         ++frames_in_window;
 
@@ -1167,6 +1253,8 @@ int main(int argc, char ** argv)
             last_video_submit = now;
           }
         }
+      } else if (options.test_pattern) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
 
       const auto fps_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - fps_window).count();
