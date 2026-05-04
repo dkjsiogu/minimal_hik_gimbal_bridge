@@ -59,20 +59,20 @@ struct Options
   std::string ffmpeg_path = "ffmpeg";
   int video_size = 300;
   int video_fps = 30;
-  int video_bitrate_kbps = 88;
-  int video_gop = 120;
+  int video_bitrate_kbps = 80;
+  int video_gop = 30;
   int crop_size = 0;
   bool static_simplify = true;
   int motion_threshold = 14;
   int motion_erode_px = 2;
   int motion_dilate_px = 6;
-  int motion_trail_frames = 90;
+  int motion_trail_frames = 30;
   double trail_disable_motion_ratio = 0.30;
   double bg_update_alpha = 0.01;
   double bg_blur_sigma = 1.2;
   int center_clear_size = 100;
   bool force_monochrome = false;
-  std::string viewer_ip = "192.168.1.50";
+  std::string viewer_ip = "";
   int viewer_port = 3335;
   std::string video_serial = "/dev/ttyUSB0";
   uint32_t video_serial_baud = 921600;
@@ -110,20 +110,20 @@ void print_help()
     << "  --ffmpeg <path>          H264 编码器路径，默认 ffmpeg\n"
     << "  --video-size <n>         0310 视频输出边长，默认 300\n"
     << "  --video-fps <n>          0310 视频编码帧率，默认 30\n"
-    << "  --video-bitrate-kbps <n> 0310 视频目标码率，默认 88 kbit/s\n"
-    << "  --video-gop <n>          H264 GOP，默认 120\n"
+    << "  --video-bitrate-kbps <n> 0310 视频目标码率，默认 80 kbit/s\n"
+    << "  --video-gop <n>          H264 GOP，默认 30\n"
     << "  --crop-size <n>          预处理中心裁剪边长，0 表示自动取最小边\n"
     << "  --no-static-simplify     关闭静态区域简化和拖影预处理\n"
     << "  --motion-threshold <n>   运动检测阈值，默认 14\n"
     << "  --motion-erode-px <n>    运动掩码腐蚀像素，默认 2\n"
     << "  --motion-dilate-px <n>   运动掩码膨胀像素，默认 6\n"
-    << "  --motion-trail-frames <n>拖影历史帧数，默认 90\n"
+    << "  --motion-trail-frames <n>拖影历史帧数，默认 30\n"
     << "  --trail-disable-motion-ratio <f> 全局运动占比超阈值时禁用拖影，默认 0.30\n"
     << "  --bg-update-alpha <f>    背景更新 alpha，默认 0.01\n"
     << "  --bg-blur-sigma <f>      静态区域模糊 sigma，默认 1.2\n"
     << "  --center-clear-size <n>  中心保护区边长，默认 100\n"
     << "  --force-monochrome       预处理后强制灰度\n"
-    << "  --viewer-ip <ip>         PV31 UDP 目标 IP，默认 192.168.1.50\n"
+    << "  --viewer-ip <ip>         可选 PV31 UDP 调试目标 IP，默认关闭\n"
     << "  --viewer-port <n>        PV31 UDP 目标端口，默认 3335\n"
     << "  --video-serial <path>    图传TX串口路径，默认 /dev/ttyUSB0\n"
     << "  --video-serial-baud <n>  图传TX串口波特率，默认 921600\n"
@@ -376,9 +376,11 @@ public:
     MV_CC_DEVICE_INFO_LIST device_list;
     std::memset(&device_list, 0, sizeof(device_list));
 
-    const auto ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
+    const auto ret = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
     if (ret != MV_OK) {
-      throw std::runtime_error("MV_CC_EnumDevices 失败: 0x" + hex_code(ret));
+      throw std::runtime_error(
+        "MV_CC_EnumDevices(MV_USB_DEVICE) 失败: 0x" + hex_code(ret) +
+        "；请确认运行时 LD_LIBRARY_PATH 包含 /opt/MVS/bin:/opt/MVS/lib/64");
     }
 
     if (device_list.nDeviceNum == 0) {
@@ -526,8 +528,11 @@ public:
       "-preset", "veryslow",
       "-tune", "zerolatency",
       "-b:v", std::to_string(clamped_bitrate) + "k",
-      "-maxrate", std::to_string(std::min(120, clamped_bitrate + 8)) + "k",
-      "-bufsize", "24k",
+      // 协议规定 0x0310 上限 50Hz, 单包 300B, 即图传链路最大 15kB/s = 120kbit/s.
+      // 启用 nal-hrd=cbr 时 maxrate 必须 == bitrate (否则 ffmpeg warn 并禁用 CBR);
+      // bufsize 取 1 秒码率, 既保证 CBR 平滑又不至于积压过深.
+      "-maxrate", std::to_string(clamped_bitrate) + "k",
+      "-bufsize", std::to_string(clamped_bitrate) + "k",
       "-g", std::to_string(clamped_gop),
       "-keyint_min", std::to_string(clamped_gop),
       "-sc_threshold", "0",
@@ -891,7 +896,7 @@ private:
   int motion_threshold_ = 14;
   int motion_erode_px_ = 2;
   int motion_dilate_px_ = 6;
-  int motion_trail_frames_ = 90;
+  int motion_trail_frames_ = 30;
   double trail_disable_motion_ratio_ = 0.30;
   double bg_update_alpha_ = 0.01;
   double bg_blur_sigma_ = 1.2;

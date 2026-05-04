@@ -1,14 +1,14 @@
 # minimal_hik_gimbal_bridge
 
-`minimal_hik_gimbal_bridge` 是一个独立于 ROS 的机载端最小工程，用来把海康相机画面和云台/下位机串口协议直接接到 RoboMaster 2026 部署模式的视频链路上。
+`minimal_hik_gimbal_bridge` 是一个独立于 ROS 的机载端最小工程，用来把海康相机画面直接接到 RoboMaster 2026 官方 `0x0310` 自定义客户端链路上。
 
 它的职责很明确：
 
 - 打开第一台海康相机
-- 打开指定串口
-- 接收下位机回传的 `GimbalToVision`
-- 生成扩展 `SP` relay 包
-- 默认把处理后的视频塞进官方 `0x0310`
+- 打开图传发送端 USB-TTL 串口，默认 `/dev/ttyUSB0 @ 921600`
+- 默认生成官方裁判系统 `0x0310` 帧并直接写入图传发送端
+- 可选接收下位机回传的 `GimbalToVision`
+- 保留扩展 `SP` relay 包用于旧调试路径
 
 ## 功能概览
 
@@ -25,11 +25,16 @@
 ```text
 minimal_hik_gimbal_bridge/
 ├── CMakeLists.txt
+├── scripts/
 ├── src/
 │   ├── main.cpp
 │   └── protocol.hpp
+├── tools/
+│   └── player_end_emulator.py
 └── README.md
 ```
+
+`tools/player_end_emulator.py` 只用于实验室：它把串口里的官方 `0x0310` 帧转成 MQTT `CustomByteBlock`，方便没有真实选手端时复现官方链路。
 
 ## 环境要求
 
@@ -75,19 +80,18 @@ build/minimal_hik_gimbal_bridge
 
 ## 这条链路做的是什么
 
-这个工程发给下位机的不是裁判系统完整外层帧，而是扩展 `SP` relay 包。下位机只需要读取其中的：
+当前主路径是直连图传发送端串口：
 
-- `referee_cmd_id`
-- `relay_data_length`
-- `relay_data[...]`
+海康相机 -> H264 -> `PV31` -> 官方 `0x0310` 裁判帧 -> `/dev/ttyUSB0` -> 图传发送端。
 
-然后把这段数据按对应命令号封到裁判系统帧里即可：
+官方约束已经固化到默认值里：
 
-- `0x0308`：小地图消息
-- `0x0309`：自定义控制器消息
-- `0x0310`：自定义客户端消息
+- 串口：`921600 8N1`
+- 命令号：`0x0310`
+- 自定义数据段：固定 300 字节
+- 发送频率：50Hz，也就是每 20ms 一包
 
-也就是说，视觉端负责生成正确 payload，下位机负责外层转发，不需要再二次解析视觉自定义格式。
+旧的 `SP` relay 包仍保留给下位机调试路径；正常图传部署不需要再让下位机二次封帧。
 
 ## `0x0310` 视频模式
 
@@ -142,23 +146,22 @@ build/minimal_hik_gimbal_bridge
 
 - `0x0310` 50Hz 建议使用 `921600 8N1`
 - 不要用 `115200` 负担 333 字节的高频 relay 包
-- 默认码率已经按低带宽场景收敛到约 `88 kbit/s`
+- 默认码率已经按官方小包链路收敛到约 `80 kbit/s`
 
 ## 运行
 
-标准视频模式：
+标准视频模式直接运行脚本即可：
 
 ```bash
-./build/minimal_hik_gimbal_bridge \
-  --serial /dev/ttyUSB0 \
-  --baud 921600 \
-  --referee-cmd 0x0310 \
-  --video-size 300 \
-  --video-fps 30 \
-  --video-bitrate-kbps 88 \
-  --motion-trail-frames 90 \
-  --motion-erode-px 2 \
-  --motion-dilate-px 6
+./scripts/run-bridge.sh
+```
+
+这个脚本只做两件事：设置海康 MVS 运行时路径，然后启动 `build/minimal_hik_gimbal_bridge`。
+
+等价命令：
+
+```bash
+LD_LIBRARY_PATH=/opt/MVS/bin:/opt/MVS/lib/64 ./build/minimal_hik_gimbal_bridge
 ```
 
 兼容旧参数：
@@ -173,33 +176,37 @@ build/minimal_hik_gimbal_bridge
 默认行为：
 
 - 自动打开第一台海康相机
-- 自动打开指定串口
-- 每 20ms 发送一包扩展 `SP` relay
+- 自动打开 `/dev/ttyUSB0` 图传发送端串口
+- 每 20ms 生成并发送一包官方 `0x0310` 数据
 - 默认在 `relay_data[300]` 中发送 `PV31` H264 分片
+- 默认直接封成官方 `0x0310` 裁判帧写入图传发送端
+- 默认关闭本地 PV31 UDP 调试输出
 - 每秒打印抓帧、FPS、发送计数和 backlog
 
 ## 常用参数
 
-- `--serial <path>`：串口路径
-- `--baud <rate>`：波特率，默认 `921600`
+- `--video-serial <path>`：直连图传发送端的 USB-TTL 串口路径，默认 `/dev/ttyUSB0`
+- `--video-serial-baud <rate>`：图传发送端串口波特率，默认 `921600`
+- `--serial <path>`：可选云台/下位机 SP 回传串口路径
 - `--referee-cmd <hex>`：目标命令号，默认 `0x0310`
 - `--relay-target <1..3>`：兼容旧映射参数
 - `--ffmpeg <path>`：ffmpeg 路径
-- `--video-size <n>`：输出边长
-- `--video-fps <n>`：编码帧率
-- `--video-bitrate-kbps <n>`：码率
-- `--video-gop <n>`：GOP
+- `--video-size <n>`：输出边长，默认 `300`
+- `--video-fps <n>`：编码帧率，默认 `30`
+- `--video-bitrate-kbps <n>`：码率，默认 `80`
+- `--video-gop <n>`：GOP，默认 `30`
 - `--crop-size <n>`：中心裁剪边长
 - `--no-static-simplify`：关闭静态简化和拖影
 - `--motion-threshold <n>`：运动阈值
 - `--motion-erode-px <n>`：掩码腐蚀
 - `--motion-dilate-px <n>`：掩码膨胀
-- `--motion-trail-frames <n>`：拖影历史帧数
+- `--motion-trail-frames <n>`：拖影历史帧数，默认 `30`
 - `--trail-disable-motion-ratio <f>`：全局运动比例过高时禁用拖影
 - `--bg-update-alpha <f>`：背景更新速度
 - `--bg-blur-sigma <f>`：静态区域模糊强度
 - `--center-clear-size <n>`：中心保护区边长
 - `--force-monochrome`：强制灰度
+- `--viewer-ip <ip>`：打开本地 PV31 UDP 调试输出，正常官方链路不需要
 
 ## 裸编码排障
 
@@ -207,8 +214,6 @@ build/minimal_hik_gimbal_bridge
 
 ```bash
 ./build/minimal_hik_gimbal_bridge \
-  --serial /dev/ttyUSB0 \
-  --referee-cmd 0x0310 \
   --no-static-simplify
 ```
 
@@ -230,13 +235,13 @@ build/minimal_hik_gimbal_bridge
 1. 先只接海康相机，确认 `frame_seq` 在增长。
 2. 再接串口，确认 `sent` 在增长。
 3. 如果下位机有 `GimbalToVision` 回传，终端会打印 `gimbal-rx`。
-4. 最后由下位机把 `relay_data` 外层封进 `0x0308/0x0309/0x0310`。
+4. 最后在解码端订阅 `CustomByteBlock`，确认 `PV31` 和 H264 解码正常。
 
 ## 常见问题
 
-### 1. 为什么不直接往裁判系统串口发？
+### 1. 为什么现在可以直接往图传发送端串口发？
 
-部署模式的正式路径仍然需要经过主控/下位机转发，机载视觉端本身不应直接跳过这一层。
+这台电脑已经通过 USB-TTL 接到图传发送端串口。按官方协议，图传发送端串口就是 `921600 8N1` 的裁判系统帧入口；这里写入的是完整 `0x0310` 官方帧，不是自定义私有包。
 
 ### 2. 为什么必须 `921600`？
 
