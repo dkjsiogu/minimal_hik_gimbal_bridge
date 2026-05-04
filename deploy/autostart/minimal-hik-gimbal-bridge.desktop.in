@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=%APP_NAME%
+Comment=%APP_COMMENT%
+Exec=%EXEC_PATH%
+Path=%WORK_DIR%
+Terminal=false
+X-GNOME-Autostart-enabled=%AUTOSTART_ENABLED%
+StartupNotify=false

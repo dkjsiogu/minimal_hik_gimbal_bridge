@@ -7,6 +7,11 @@ PROJECT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 BRIDGE_BIN=${BRIDGE_BIN:-$PROJECT_DIR/build/minimal_hik_gimbal_bridge}
 MVS_RUNTIME_PATH=${MVS_RUNTIME_PATH:-/opt/MVS/bin:/opt/MVS/lib/64}
 
+STARTUP_DELAY=${RM_BRIDGE_STARTUP_DELAY:-0}
+if [[ "$STARTUP_DELAY" =~ ^[0-9]+$ ]] && (( STARTUP_DELAY > 0 )); then
+  sleep "$STARTUP_DELAY"
+fi
+
 if [[ ! -x "$BRIDGE_BIN" ]]; then
   echo "缺少 bridge 二进制: $BRIDGE_BIN" >&2
   echo "先执行: cmake -S . -B build && cmake --build build -j" >&2

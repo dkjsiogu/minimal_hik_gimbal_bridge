@@ -25,6 +25,7 @@
 ```text
 minimal_hik_gimbal_bridge/
 ├── CMakeLists.txt
+├── deploy/
 ├── scripts/
 ├── src/
 │   ├── main.cpp
@@ -162,6 +163,20 @@ build/minimal_hik_gimbal_bridge
 
 ```bash
 LD_LIBRARY_PATH=/opt/MVS/bin:/opt/MVS/lib/64 ./build/minimal_hik_gimbal_bridge
+```
+
+一键安装本机自启动：
+
+```bash
+./scripts/install-autostart.sh
+```
+
+这个脚本会自动构建 bridge，然后在当前仓库下生成 `bin/` 并安装桌面自启动项 `RoboMaster Hik Bridge`。
+
+如果你已经手动编译过，可以跳过构建：
+
+```bash
+./scripts/install-autostart.sh --skip-build
 ```
 
 兼容旧参数：
