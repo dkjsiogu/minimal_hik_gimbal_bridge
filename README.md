@@ -7,29 +7,41 @@
 - 打开第一台海康相机
 - 打开图传发送端 USB-TTL 串口，默认 `/dev/ttyUSB0 @ 921600`
 - 默认生成官方裁判系统 `0x0310` 帧并直接写入图传发送端
-- 可选接收下位机回传的 `GimbalToVision`
-- 保留扩展 `SP` relay 包用于旧调试路径
 
 ## 功能概览
 
 - 海康相机自动枚举与取流
+- 海康相机掉线后持续重连
+- 图传发送端串口掉线后持续重连
 - 串口 `921600 8N1` 通讯
-- `0x0308 / 0x0309 / 0x0310` relay 数据打包
-- 默认 `0x0310` 视频模式
+- 官方 `0x0310` 视频模式
 - `PV31` H264 分片
+- `--preview` 原画预览和曝光/增益实时调节，支持按键保存配置
 - OpenCV 静态简化 / 运动掩码 / 拖影预处理
-- `--0310-telemetry` 调试模式
 
 ## 目录结构
 
 ```text
 minimal_hik_gimbal_bridge/
 ├── CMakeLists.txt
+├── bridge/
+│   ├── camera_preview.cpp / camera_preview.hpp
+│   ├── frame_preprocessor.cpp / frame_preprocessor.hpp
+│   ├── h264_encoder.cpp / h264_encoder.hpp
+│   ├── hik_camera.cpp / hik_camera.hpp
+│   ├── options.cpp / options.hpp
+│   ├── protocol.hpp
+│   ├── serial_port.cpp / serial_port.hpp
+│   └── udp_sender.cpp / udp_sender.hpp
+├── config/
+│   └── bridge.yaml
 ├── deploy/
 ├── scripts/
 ├── src/
-│   ├── main.cpp
-│   └── protocol.hpp
+│   └── main.cpp
+├── third_party/
+│   ├── hikrobot/
+│   └── serial/
 ├── tools/
 │   └── player_end_emulator.py
 └── README.md
@@ -42,9 +54,8 @@ minimal_hik_gimbal_bridge/
 - Ubuntu Linux
 - CMake 3.16+
 - C++17 编译器
-- OpenCV（`core` + `imgproc`）
+- OpenCV（`core` + `imgproc` + `highgui`）
 - 系统 `ffmpeg`
-- 海康 MVS SDK
 
 推荐安装：
 
@@ -55,16 +66,46 @@ sudo apt install -y build-essential cmake pkg-config libopencv-dev ffmpeg
 
 ## 海康 SDK
 
-默认 CMake 使用：
+仓库已经自带一份 HikRobot SDK：
 
-- 头文件：`/home/dkjsiogu/文档/sp_vision_25/io/hikrobot/include`
-- 库文件：`/home/dkjsiogu/文档/sp_vision_25/io/hikrobot/lib/amd64`
+- `third_party/hikrobot/include`
+- `third_party/hikrobot/lib/<amd64|arm64>`
+
+默认构建直接使用这份 vendored SDK，不再依赖外部 `sp_vision` 工程。
+
+USB 相机运行时还需要 MVS 的 transport layer（例如 `libMvUsb3vTL.so`）。`scripts/run-bridge.sh` 会在存在 `/opt/MVS/lib/64` 时自动把它加进 `LD_LIBRARY_PATH`，这样真实 USB 相机可以正常枚举；如果你的 MVS 安装在其他位置，可以运行前设置 `SYSTEM_MVS_RUNTIME_PATH=/path/to/MVS/lib/64`。
 
 如果你的 SDK 放在别处，编译时指定：
 
 ```bash
 cmake -S . -B build -DHIKROBOT_SDK_DIR=/your/hikrobot
 ```
+
+## YAML 配置
+
+曝光、增益和图像旋转矩阵现在默认从 `config/bridge.yaml` 读取，直接改这个文件：
+
+```yaml
+camera:
+  exposure_ms: 10.0
+  gain: 12.0
+image:
+  rotation_matrix: !!opencv-matrix
+    rows: 2
+    cols: 2
+    dt: d
+    data: [ 1., 0., 0., 1. ]
+```
+
+如果你想用别的文件，运行时加：
+
+```bash
+./build/minimal_hik_gimbal_bridge --config /path/to/bridge.yaml
+```
+
+旋转矩阵只从 YAML 读取；命令行参数仍然只覆盖 `--exposure-ms` 和 `--gain`。
+
+如果你开了 `--preview`，按 `S` 会把当前曝光、增益以及当前旋转矩阵一起保存回 YAML。
 
 ## 编译
 
@@ -92,8 +133,6 @@ build/minimal_hik_gimbal_bridge
 - 自定义数据段：固定 300 字节
 - 发送频率：50Hz，也就是每 20ms 一包
 
-旧的 `SP` relay 包仍保留给下位机调试路径；正常图传部署不需要再让下位机二次封帧。
-
 ## `0x0310` 视频模式
 
 默认工作模式是 `0x0310` 视频：
@@ -105,6 +144,7 @@ build/minimal_hik_gimbal_bridge
 当前默认预处理包括：
 
 - 中心正方形裁剪
+- 按 YAML 旋转矩阵做旋转校正
 - 固定边长缩放到 `video_size`
 - 中心 ROI 保真，默认 `170x170`
 - 外围静态区域灰度化、降纹理、模糊和时域稳定
@@ -126,23 +166,6 @@ build/minimal_hik_gimbal_bridge
 - 默认串口波特率 `921600`
 - `flags & 1` 表示码流重启
 
-## 调试 telemetry 模式
-
-如果加上：
-
-```bash
---0310-telemetry
-```
-
-则 `0x0310` 不再发送视频，而是发送 `VehicleTelemetryV1`，用于调试：
-
-- 相机在线状态
-- gimbal 在线状态
-- 分辨率 / FPS / frame_seq
-- 曝光 / 增益
-- yaw / pitch / bullet_speed / bullet_count
-- 状态文本
-
 ## 编码和串口建议
 
 - `0x0310` 50Hz 建议使用 `921600 8N1`
@@ -158,11 +181,12 @@ build/minimal_hik_gimbal_bridge
 ```
 
 这个脚本只做两件事：设置海康 MVS 运行时路径，然后启动 `build/minimal_hik_gimbal_bridge`。
+默认会把完整 MVS 运行时 `/opt/MVS/lib/64` 和仓库内 `third_party/hikrobot/lib/<arch>` 加进 `LD_LIBRARY_PATH`。
 
 等价命令：
 
 ```bash
-LD_LIBRARY_PATH=/opt/MVS/bin:/opt/MVS/lib/64 ./build/minimal_hik_gimbal_bridge
+LD_LIBRARY_PATH=/opt/MVS/lib/64:./third_party/hikrobot/lib/amd64 ./build/minimal_hik_gimbal_bridge
 ```
 
 一键安装本机自启动：
@@ -186,21 +210,14 @@ LD_LIBRARY_PATH=/opt/MVS/bin:/opt/MVS/lib/64 ./build/minimal_hik_gimbal_bridge
 tail -f logs/bridge-autostart.log
 ```
 
-兼容旧参数：
-
-```bash
-./build/minimal_hik_gimbal_bridge \
-  --serial /dev/ttyUSB0 \
-  --relay-target 3 \
-  --payload-text HIK-GIMBAL
-```
-
 默认行为：
 
 - 自动打开第一台海康相机
+- 海康相机掉线后每 `200ms` 持续重连
 - 自动打开 `/dev/ttyUSB0` 图传发送端串口
+- 图传发送端串口掉线后每 `200ms` 持续重连
 - 每 20ms 生成并发送一包官方 `0x0310` 数据
-- 默认在 `relay_data[300]` 中发送 `PV31` H264 分片
+- 默认在 `0x0310` 自定义数据段中发送 `PV31` H264 分片
 - 默认直接封成官方 `0x0310` 裁判帧写入图传发送端
 - 默认关闭本地 PV31 UDP 调试输出
 - 每秒打印抓帧、FPS、发送计数和 backlog
@@ -209,9 +226,8 @@ tail -f logs/bridge-autostart.log
 
 - `--video-serial <path>`：直连图传发送端的 USB-TTL 串口路径，默认 `/dev/ttyUSB0`
 - `--video-serial-baud <rate>`：图传发送端串口波特率，默认 `921600`
-- `--serial <path>`：可选云台/下位机 SP 回传串口路径
-- `--referee-cmd <hex>`：目标命令号，默认 `0x0310`
-- `--relay-target <1..3>`：兼容旧映射参数
+- `--config <path>`：YAML 配置文件，默认自动尝试 `config/bridge.yaml`
+- `--preview`：显示海康原画，并在窗口里直接调曝光和增益
 - `--ffmpeg <path>`：ffmpeg 路径
 - `--video-size <n>`：输出边长，默认 `300`
 - `--video-fps <n>`：编码帧率，默认 `30`
@@ -239,25 +255,23 @@ tail -f logs/bridge-autostart.log
   --no-static-simplify
 ```
 
-## 下位机对接约定
+## 解码端对接约定
 
-下位机需要做的只有两步：
+图传发送端收到的是完整官方裁判系统 `0x0310` 帧。解码端需要做的只有两步：
 
-1. 读取 `SP` 包里的 `referee_cmd_id` 和 `relay_data`
-2. 把 `relay_data[0:relay_data_length]` 原样封进对应裁判系统命令
+1. 从 `0x0310` 自定义数据段取出 300 字节数据
+2. 按 `PV31` 头解析 H264 分片并送入解码器
 
 不需要做的事情：
 
 - 不需要重新编码视频
 - 不需要理解 `PV31` 内层格式
-- 不需要拆 telemetry 字段
 
 ## 最小验证流程
 
 1. 先只接海康相机，确认 `frame_seq` 在增长。
 2. 再接串口，确认 `sent` 在增长。
-3. 如果下位机有 `GimbalToVision` 回传，终端会打印 `gimbal-rx`。
-4. 最后在解码端订阅 `CustomByteBlock`，确认 `PV31` 和 H264 解码正常。
+3. 最后在解码端订阅 `CustomByteBlock`，确认 `PV31` 和 H264 解码正常。
 
 ## 常见问题
 

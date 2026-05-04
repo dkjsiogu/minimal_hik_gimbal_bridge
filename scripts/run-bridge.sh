@@ -4,9 +4,20 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
+case "$(uname -m)" in
+  aarch64|arm64|ARM64)
+    HIK_LIB_ARCH=arm64
+    ;;
+  *)
+    HIK_LIB_ARCH=amd64
+    ;;
+esac
+
 BRIDGE_BIN=${BRIDGE_BIN:-$PROJECT_DIR/build/minimal_hik_gimbal_bridge}
-MVS_RUNTIME_PATH=${MVS_RUNTIME_PATH:-/opt/MVS/bin:/opt/MVS/lib/64}
+MVS_RUNTIME_PATH=${MVS_RUNTIME_PATH:-$PROJECT_DIR/third_party/hikrobot/lib/$HIK_LIB_ARCH}
+SYSTEM_MVS_RUNTIME_PATH=${SYSTEM_MVS_RUNTIME_PATH:-/opt/MVS/lib/64}
 LOG_PATH=${RM_BRIDGE_LOG_PATH:-$PROJECT_DIR/logs/bridge.log}
+DEFAULT_CONFIG_PATH="$PROJECT_DIR/config/bridge.yaml"
 
 if [[ "${RM_BRIDGE_LOG_TO_FILE:-0}" == "1" || "${RM_BRIDGE_LOG_TO_FILE:-false}" == "true" ]]; then
   mkdir -p -- "$(dirname -- "$LOG_PATH")"
@@ -26,7 +37,32 @@ if [[ ! -x "$BRIDGE_BIN" ]]; then
   exit 1
 fi
 
-export LD_LIBRARY_PATH="$MVS_RUNTIME_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+MVS_LIBRARY_PATHS=()
+if [[ -d "$SYSTEM_MVS_RUNTIME_PATH" ]]; then
+  MVS_LIBRARY_PATHS+=("$SYSTEM_MVS_RUNTIME_PATH")
+fi
+if [[ -d "$MVS_RUNTIME_PATH" && "$MVS_RUNTIME_PATH" != "$SYSTEM_MVS_RUNTIME_PATH" ]]; then
+  MVS_LIBRARY_PATHS+=("$MVS_RUNTIME_PATH")
+fi
 
-echo "[$(date '+%F %T')] exec $BRIDGE_BIN $*"
-exec "$BRIDGE_BIN" "$@"
+MVS_LIBRARY_PATH=$(IFS=:; echo "${MVS_LIBRARY_PATHS[*]}")
+if [[ -n "$MVS_LIBRARY_PATH" ]]; then
+  export LD_LIBRARY_PATH="$MVS_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+BRIDGE_ARGS=("$@")
+if [[ -f "$DEFAULT_CONFIG_PATH" ]]; then
+  HAS_CONFIG_ARG=0
+  for arg in "$@"; do
+    if [[ "$arg" == "--config" ]]; then
+      HAS_CONFIG_ARG=1
+      break
+    fi
+  done
+  if (( HAS_CONFIG_ARG == 0 )); then
+    BRIDGE_ARGS=(--config "$DEFAULT_CONFIG_PATH" "$@")
+  fi
+fi
+
+echo "[$(date '+%F %T')] exec $BRIDGE_BIN ${BRIDGE_ARGS[*]}"
+exec "$BRIDGE_BIN" "${BRIDGE_ARGS[@]}"
