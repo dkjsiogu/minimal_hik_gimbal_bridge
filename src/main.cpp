@@ -67,15 +67,15 @@ int main(int argc, char ** argv)
     bridge::UdpSender viewer_udp;
     if (!options.viewer_ip.empty()) {
       if (viewer_udp.open(options.viewer_ip, options.viewer_port)) {
-        std::cout << "[bridge] PV31 UDP target: " << options.viewer_ip << ":" << options.viewer_port << std::endl;
+        std::cout << "[bridge] 0x0310 UDP target: " << options.viewer_ip << ":" << options.viewer_port << std::endl;
       } else {
-        std::cerr << "[bridge] WARNING: PV31 UDP not available, video will only go via serial" << std::endl;
+        std::cerr << "[bridge] WARNING: 0x0310 UDP not available, video will only go via serial" << std::endl;
       }
     }
 
     bridge::SerialPort video_serial;
     if (!options.video_serial.empty()) {
-      std::cout << "[bridge] PV31 video serial reconnect loop: " << options.video_serial
+      std::cout << "[bridge] 0x0310 video serial reconnect loop: " << options.video_serial
                 << " baud=" << options.video_serial_baud << std::endl;
     }
 
@@ -129,18 +129,19 @@ int main(int argc, char ** argv)
 
       try {
         video_serial.open_or_throw(options.video_serial, options.video_serial_baud);
-        std::cout << "[bridge] PV31 video serial ready: " << options.video_serial
+        std::cout << "[bridge] 0x0310 video serial ready: " << options.video_serial
                   << " baud=" << options.video_serial_baud << std::endl;
       } catch (const std::exception & error) {
         next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
         if (bridge::should_log_at_interval(now, last_video_serial_open_error, bridge::kReconnectLogInterval)) {
-          std::cerr << "[bridge] PV31 video serial reconnect failed: " << error.what() << std::endl;
+          std::cerr << "[bridge] 0x0310 video serial reconnect failed: " << error.what() << std::endl;
         }
       }
     };
 
     std::cout << "[bridge] preprocess crop=" << options.crop_size
               << " output=" << preprocessor.output_size() << 'x' << preprocessor.output_size()
+              << " center_circle_radius=" << options.center_clear_radius
               << " static_simplify=" << (options.static_simplify ? "on" : "off")
               << " trail=" << options.motion_trail_frames
               << " erode=" << options.motion_erode_px
@@ -239,16 +240,12 @@ int main(int argc, char ** argv)
 
         if (packet_ready) {
           bridge::protocol::CustomClientVideo0310Chunk packet{};
-          const auto stream_ms = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - video_stream_start).count());
           const auto flags = video_reset ? 1U : 0U;
           video_reset = false;
           bridge::protocol::fill_custom_client_0310_video_chunk(
             packet,
-            bridge::protocol::kCustomClientVideo0310CodecH264,
             static_cast<uint8_t>(flags),
-            video_sequence++,
-            stream_ms,
+            static_cast<uint8_t>(video_sequence++),
             video_chunk.data(),
             video_chunk_size);
 

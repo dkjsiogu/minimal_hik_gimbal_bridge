@@ -9,24 +9,20 @@ namespace bridge::protocol
 {
 inline constexpr uint16_t kCustomClient0310CmdId = 0x0310;
 inline constexpr std::size_t kCustomClient0310PayloadBytes = 300U;
-inline constexpr uint8_t kCustomClientVideo0310Version = 1U;
 inline constexpr uint8_t kCustomClientVideo0310CodecH264 = 1U;
 inline constexpr uint8_t kCustomClientVideo0310CodecHevc = 2U;
-inline constexpr std::size_t kCustomClientVideo0310HeaderBytes = 24U;
-inline constexpr std::size_t kCustomClientVideo0310PayloadBytes = 276U;
+inline constexpr uint8_t kCustomClientVideo0310FlagReset = 0x01U;
+inline constexpr uint8_t kCustomClientVideo0310PayloadBytesMsbMask = 0x02U;
+inline constexpr uint8_t kCustomClientVideo0310ReservedMask = 0xFCU;
+inline constexpr std::size_t kCustomClientVideo0310HeaderBytes = 3U;
+inline constexpr std::size_t kCustomClientVideo0310PayloadBytes =
+  kCustomClient0310PayloadBytes - kCustomClientVideo0310HeaderBytes;
 
 struct __attribute__((packed)) CustomClientVideo0310Chunk
 {
-  uint8_t magic[4] = {'P', 'V', '3', '1'};
-  uint8_t version = kCustomClientVideo0310Version;
-  uint8_t header_bytes = kCustomClientVideo0310HeaderBytes;
-  uint8_t codec = kCustomClientVideo0310CodecH264;
-  uint8_t flags = 0;
-  uint32_t sequence = 0;
-  uint32_t stream_ms = 0;
-  uint16_t payload_bytes = 0;
-  uint16_t payload_checksum = 0;
-  uint32_t reserved0 = 0;
+  uint8_t flags_and_payload_bytes_msb = 0;
+  uint8_t sequence = 0;
+  uint8_t payload_bytes_lsb = 0;
   uint8_t payload[kCustomClientVideo0310PayloadBytes] = {0};
 };
 
@@ -142,21 +138,21 @@ inline uint16_t checksum16(const uint8_t * data, std::size_t len)
 
 inline void fill_custom_client_0310_video_chunk(
   CustomClientVideo0310Chunk & packet,
-  uint8_t codec,
   uint8_t flags,
-  uint32_t sequence,
-  uint32_t stream_ms,
+  uint8_t sequence,
   const uint8_t * data,
   std::size_t size)
 {
-  packet.codec = codec;
-  packet.flags = flags;
-  packet.sequence = sequence;
-  packet.stream_ms = stream_ms;
-  packet.payload_bytes = static_cast<uint16_t>(std::min(size, sizeof(packet.payload)));
-  if (packet.payload_bytes > 0U) {
-    std::memcpy(packet.payload, data, packet.payload_bytes);
+  const auto payload_bytes = static_cast<uint16_t>(std::min(size, sizeof(packet.payload)));
+  packet.flags_and_payload_bytes_msb = static_cast<uint8_t>(flags & kCustomClientVideo0310FlagReset);
+  if ((payload_bytes & 0x0100U) != 0U) {
+    packet.flags_and_payload_bytes_msb = static_cast<uint8_t>(
+      packet.flags_and_payload_bytes_msb | kCustomClientVideo0310PayloadBytesMsbMask);
   }
-  packet.payload_checksum = checksum16(packet.payload, packet.payload_bytes);
+  packet.sequence = sequence;
+  packet.payload_bytes_lsb = static_cast<uint8_t>(payload_bytes & 0x00FFU);
+  if (payload_bytes > 0U) {
+    std::memcpy(packet.payload, data, payload_bytes);
+  }
 }
 }  // namespace bridge::protocol

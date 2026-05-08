@@ -14,6 +14,47 @@
 namespace bridge
 {
 
+namespace
+{
+
+constexpr std::size_t kTargetSliceMaxBytes = 280U;
+
+struct AnnexBStartCode
+{
+  std::size_t offset = 0;
+  std::size_t bytes = 0;
+};
+
+bool find_annexb_start_code(
+  const std::vector<uint8_t> & buffer,
+  std::size_t from,
+  AnnexBStartCode & start_code)
+{
+  if (buffer.size() < 3 || from >= buffer.size()) {
+    return false;
+  }
+
+  for (std::size_t i = from; i + 2 < buffer.size(); ++i) {
+    if (buffer[i] != 0 || buffer[i + 1] != 0) {
+      continue;
+    }
+    if (buffer[i + 2] == 1) {
+      start_code.offset = i;
+      start_code.bytes = 3;
+      return true;
+    }
+    if (i + 3 < buffer.size() && buffer[i + 2] == 0 && buffer[i + 3] == 1) {
+      start_code.offset = i;
+      start_code.bytes = 4;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+}  // namespace
+
 H264EncoderProcess::H264EncoderProcess() = default;
 
 H264EncoderProcess::~H264EncoderProcess()
@@ -56,13 +97,16 @@ void H264EncoderProcess::start(uint16_t width, uint16_t height, const Options & 
 
   const auto clamped_size = std::clamp(options.video_size, 120, 480);
   const auto clamped_fps = std::clamp(options.video_fps, 10, 60);
-  const auto clamped_bitrate = std::clamp(options.video_bitrate_kbps, 40, 110);
-  const auto clamped_gop = std::clamp(options.video_gop, clamped_fps, clamped_fps * 12);
+  const auto clamped_bitrate = std::clamp(options.video_bitrate_kbps, 40, 116);
+  const auto clamped_gop = std::clamp(options.video_gop, 1, clamped_fps * 12);
   const std::string input_size = std::to_string(width) + "x" + std::to_string(height);
   const std::string video_filter =
     "hqdn3d=4:3:6:4,"
     "eq=contrast=1.12:saturation=0.75:gamma=1.05,"
     "format=yuv420p";
+  const std::string x264_params =
+    "repeat-headers=1:nal-hrd=cbr:force-cfr=1:ref=1:slice-max-size=" +
+    std::to_string(kTargetSliceMaxBytes);
 
   std::vector<std::string> args = {
     options.ffmpeg_path,
@@ -85,7 +129,7 @@ void H264EncoderProcess::start(uint16_t width, uint16_t height, const Options & 
     "-keyint_min", std::to_string(clamped_gop),
     "-sc_threshold", "0",
     "-bf", "0",
-    "-x264-params", "repeat-headers=1:nal-hrd=cbr:force-cfr=1",
+    "-x264-params", x264_params,
     "-pix_fmt", "yuv420p",
     "-f", "h264",
     "pipe:1"};
@@ -131,7 +175,8 @@ void H264EncoderProcess::start(uint16_t width, uint16_t height, const Options & 
             << " output=" << clamped_size << "x" << clamped_size
             << " fps=" << clamped_fps
             << " bitrate=" << clamped_bitrate << "kbit/s"
-            << " gop=" << clamped_gop << std::endl;
+            << " gop=" << clamped_gop
+            << " slice_max=" << kTargetSliceMaxBytes << "B" << std::endl;
 }
 
 void H264EncoderProcess::stop()
@@ -193,15 +238,71 @@ bool H264EncoderProcess::pop_chunk(
   std::size_t & chunk_size)
 {
   std::lock_guard<std::mutex> lock(buffer_mutex_);
+  chunk.fill(0);
   if (encoded_buffer_.empty()) {
     chunk_size = 0;
     return false;
   }
 
-  chunk_size = std::min(chunk.size(), encoded_buffer_.size());
-  std::copy_n(encoded_buffer_.begin(), chunk_size, chunk.begin());
-  encoded_buffer_.erase(encoded_buffer_.begin(), encoded_buffer_.begin() + static_cast<long>(chunk_size));
-  return true;
+  AnnexBStartCode start_code{};
+  if (find_annexb_start_code(encoded_buffer_, 0, start_code) && start_code.offset > 0) {
+    encoded_buffer_.erase(
+      encoded_buffer_.begin(),
+      encoded_buffer_.begin() + static_cast<long>(start_code.offset));
+  }
+
+  std::size_t packet_bytes = 0;
+  while (!encoded_buffer_.empty()) {
+    AnnexBStartCode current_start{};
+    if (!find_annexb_start_code(encoded_buffer_, 0, current_start) || current_start.offset != 0) {
+      if (packet_bytes > 0) {
+        break;
+      }
+
+      chunk_size = std::min(chunk.size(), encoded_buffer_.size());
+      std::copy_n(encoded_buffer_.begin(), chunk_size, chunk.begin());
+      encoded_buffer_.erase(
+        encoded_buffer_.begin(),
+        encoded_buffer_.begin() + static_cast<long>(chunk_size));
+      return true;
+    }
+
+    AnnexBStartCode next_start{};
+    if (!find_annexb_start_code(encoded_buffer_, current_start.bytes, next_start)) {
+      break;
+    }
+
+    const std::size_t nal_bytes = next_start.offset;
+    if (nal_bytes > chunk.size()) {
+      if (packet_bytes == 0) {
+        chunk_size = chunk.size();
+        std::copy_n(encoded_buffer_.begin(), chunk_size, chunk.begin());
+        encoded_buffer_.erase(
+          encoded_buffer_.begin(),
+          encoded_buffer_.begin() + static_cast<long>(chunk_size));
+        return true;
+      }
+      break;
+    }
+
+    if (packet_bytes + nal_bytes > chunk.size()) {
+      break;
+    }
+
+    std::copy_n(encoded_buffer_.begin(), nal_bytes, chunk.begin() + static_cast<long>(packet_bytes));
+    packet_bytes += nal_bytes;
+    encoded_buffer_.erase(
+      encoded_buffer_.begin(),
+      encoded_buffer_.begin() + static_cast<long>(nal_bytes));
+  }
+
+  if (packet_bytes > 0) {
+    chunk_size = packet_bytes;
+    return true;
+  }
+
+  chunk_size = 0;
+  return false;
 }
 
 std::size_t H264EncoderProcess::queued_bytes() const

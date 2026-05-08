@@ -61,6 +61,7 @@ FramePreprocessor::FramePreprocessor(const Options & options)
   bg_update_alpha_(std::clamp(options.bg_update_alpha, 0.001, 0.2)),
   bg_blur_sigma_(std::max(0.0, options.bg_blur_sigma)),
   center_clear_size_(std::max(0, options.center_clear_size)),
+  center_clear_radius_(std::max(0, options.center_clear_radius)),
   force_monochrome_(options.force_monochrome)
 {
 }
@@ -100,6 +101,18 @@ cv::Mat FramePreprocessor::process_rgb24(const FrameInfo & frame)
     cv::Mat gray;
     cv::cvtColor(working, gray, cv::COLOR_BGR2GRAY);
     cv::cvtColor(gray, working, cv::COLOR_GRAY2BGR);
+  }
+
+  if (center_clear_radius_ > 0) {
+    cv::Mat detail_blur;
+    cv::Mat detailed_focus;
+    cv::GaussianBlur(working, detail_blur, cv::Size(), 0.85, 0.85);
+    cv::addWeighted(working, 1.45, detail_blur, -0.45, 0.0, detailed_focus);
+
+    cv::Mat focused = cv::Mat::zeros(working.size(), working.type());
+    detailed_focus.copyTo(focused, center_circle_mask(working.size()));
+    reset_history();
+    return focused;
   }
 
   if (!static_simplify_) {
@@ -203,6 +216,31 @@ void FramePreprocessor::reset_history()
   background_gray_f32_.release();
   motion_erode_kernel_.release();
   motion_dilate_kernel_.release();
+}
+
+cv::Mat FramePreprocessor::center_circle_mask(const cv::Size & size)
+{
+  const int radius = std::min({center_clear_radius_, size.width / 2, size.height / 2});
+  if (radius <= 0) {
+    return {};
+  }
+
+  if (!center_circle_mask_cache_.empty() &&
+      center_circle_mask_cache_.size() == size &&
+      center_circle_mask_radius_ == radius) {
+    return center_circle_mask_cache_;
+  }
+
+  center_circle_mask_cache_ = cv::Mat::zeros(size, CV_8UC1);
+  cv::circle(
+    center_circle_mask_cache_,
+    cv::Point(size.width / 2, size.height / 2),
+    radius,
+    cv::Scalar(255),
+    cv::FILLED,
+    cv::LINE_AA);
+  center_circle_mask_radius_ = radius;
+  return center_circle_mask_cache_;
 }
 
 }  // namespace bridge

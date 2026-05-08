@@ -15,7 +15,7 @@
 - 图传发送端串口掉线后持续重连
 - 串口 `921600 8N1` 通讯
 - 官方 `0x0310` 视频模式
-- `PV31` H264 分片
+- 紧凑 `0x0310` H264 分片
 - `--preview` 原画预览和曝光/增益实时调节，支持按键保存配置
 - OpenCV 静态简化 / 运动掩码 / 拖影预处理
 
@@ -124,7 +124,7 @@ build/minimal_hik_gimbal_bridge
 
 当前主路径是直连图传发送端串口：
 
-海康相机 -> H264 -> `PV31` -> 官方 `0x0310` 裁判帧 -> `/dev/ttyUSB0` -> 图传发送端。
+海康相机 -> H264 -> 紧凑视频分片 -> 官方 `0x0310` 裁判帧 -> `/dev/ttyUSB0` -> 图传发送端。
 
 官方约束已经固化到默认值里：
 
@@ -137,7 +137,7 @@ build/minimal_hik_gimbal_bridge
 
 默认工作模式是 `0x0310` 视频：
 
-海康帧 -> RGB24 -> OpenCV 预处理 -> ffmpeg/libx264 -> `PV31` -> `0x0310`
+海康帧 -> RGB24 -> OpenCV 预处理 -> ffmpeg/libx264 -> 紧凑视频分片 -> `0x0310`
 
 ### 预处理内容
 
@@ -146,18 +146,17 @@ build/minimal_hik_gimbal_bridge
 - 中心正方形裁剪
 - 按 YAML 旋转矩阵做旋转校正
 - 固定边长缩放到 `video_size`
-- 中心 ROI 保真，默认 `170x170`
-- 外围静态区域灰度化、降纹理、模糊和时域稳定
-- 运动区域保真
-- 历史帧拖影叠加
+- 中心圆形 ROI 保真，默认半径 `112` 像素
+- 圆外直接压黑，尽量把码率留给中心区域
+- 如关闭中心圆模式，才回退到外围静态区域灰度化、降纹理和模糊
 - 后级轻量降噪与颜色压缩优化
 
-### `PV31` 格式
+### 紧凑视频分片格式
 
 `0x0310` 数据段固定 300 字节：
 
-- 24 字节头：`PV31` / version / codec / flags / sequence / stream_ms / payload_bytes / payload_checksum
-- 276 字节 H264 净荷
+- 3 字节头：`flags_and_payload_hi` / `sequence` / `payload_bytes_lo`
+- 297 字节 H264 净荷
 
 约束：
 
@@ -165,12 +164,14 @@ build/minimal_hik_gimbal_bridge
 - 默认 50Hz（每 20ms 一包）
 - 默认串口波特率 `921600`
 - `flags & 1` 表示码流重启
+- 编码侧按接近单包净荷的 slice 大小收敛，尽量减少一个丢包破坏多个 NAL
 
 ## 编码和串口建议
 
 - `0x0310` 50Hz 建议使用 `921600 8N1`
 - 不要用 `115200` 负担 333 字节的高频 relay 包
-- 默认码率已经按官方小包链路收敛到约 `80 kbit/s`
+- 默认码率已经顶到官方小包链路净荷上限附近，约 `116 kbit/s`
+- 默认 GOP 已缩到 `10`，无重传链路下更快从丢包中恢复
 
 ## 运行
 
@@ -217,9 +218,9 @@ tail -f logs/bridge-autostart.log
 - 自动打开 `/dev/ttyUSB0` 图传发送端串口
 - 图传发送端串口掉线后每 `200ms` 持续重连
 - 每 20ms 生成并发送一包官方 `0x0310` 数据
-- 默认在 `0x0310` 自定义数据段中发送 `PV31` H264 分片
+- 默认在 `0x0310` 自定义数据段中发送紧凑 H264 分片
 - 默认直接封成官方 `0x0310` 裁判帧写入图传发送端
-- 默认关闭本地 PV31 UDP 调试输出
+- 默认关闭本地 `0x0310` UDP 调试输出
 - 每秒打印抓帧、FPS、发送计数和 backlog
 
 ## 常用参数
@@ -231,20 +232,21 @@ tail -f logs/bridge-autostart.log
 - `--ffmpeg <path>`：ffmpeg 路径
 - `--video-size <n>`：输出边长，默认 `300`
 - `--video-fps <n>`：编码帧率，默认 `30`
-- `--video-bitrate-kbps <n>`：码率，默认 `80`
-- `--video-gop <n>`：GOP，默认 `30`
+- `--video-bitrate-kbps <n>`：码率，默认 `116`
+- `--video-gop <n>`：GOP，默认 `10`
 - `--crop-size <n>`：中心裁剪边长
 - `--no-static-simplify`：关闭静态简化和拖影
 - `--motion-threshold <n>`：运动阈值
 - `--motion-erode-px <n>`：掩码腐蚀
 - `--motion-dilate-px <n>`：掩码膨胀
-- `--motion-trail-frames <n>`：拖影历史帧数，默认 `30`
+- `--motion-trail-frames <n>`：拖影历史帧数，默认 `0`
 - `--trail-disable-motion-ratio <f>`：全局运动比例过高时禁用拖影
 - `--bg-update-alpha <f>`：背景更新速度
 - `--bg-blur-sigma <f>`：静态区域模糊强度，默认 `1.9`
 - `--center-clear-size <n>`：中心保真区边长，默认 `170`
+- `--center-clear-radius <n>`：中心圆形保真半径，默认 `112`；大于 `0` 时圆外压黑
 - `--force-monochrome`：强制灰度
-- `--viewer-ip <ip>`：打开本地 PV31 UDP 调试输出，正常官方链路不需要
+- `--viewer-ip <ip>`：打开本地 `0x0310` UDP 调试输出，正常官方链路不需要
 
 ## 裸编码排障
 
@@ -260,18 +262,18 @@ tail -f logs/bridge-autostart.log
 图传发送端收到的是完整官方裁判系统 `0x0310` 帧。解码端需要做的只有两步：
 
 1. 从 `0x0310` 自定义数据段取出 300 字节数据
-2. 按 `PV31` 头解析 H264 分片并送入解码器
+2. 按 3 字节紧凑头解析 H264 分片并送入解码器
 
 不需要做的事情：
 
 - 不需要重新编码视频
-- 不需要理解 `PV31` 内层格式
+- 不需要处理历史兼容头
 
 ## 最小验证流程
 
 1. 先只接海康相机，确认 `frame_seq` 在增长。
 2. 再接串口，确认 `sent` 在增长。
-3. 最后在解码端订阅 `CustomByteBlock`，确认 `PV31` 和 H264 解码正常。
+3. 最后在解码端订阅 `CustomByteBlock`，确认紧凑分片和 H264 解码正常。
 
 ## 常见问题
 
