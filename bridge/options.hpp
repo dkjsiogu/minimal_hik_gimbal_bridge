@@ -10,9 +10,12 @@ namespace bridge
 struct Options
 {
   std::string config_path = "";
+  std::string camera_serial_number = "";
   double exposure_ms = 10.0;
   double gain = 12.0;
   std::array<double, 4> rotation_matrix = {1.0, 0.0, 0.0, 1.0};
+  double crop_center_x = 0.5;
+  double crop_center_y = 0.5;
   int send_interval_ms = 20;
   std::string ffmpeg_path = "ffmpeg";
   int video_size = 300;
@@ -33,6 +36,7 @@ struct Options
   bool force_monochrome = false;
   bool test_pattern = false;
   bool preview = false;
+  bool list_cameras = false;
   std::string viewer_ip = "";
   int viewer_port = 3335;
   std::string video_serial = "/dev/ttyUSB0";

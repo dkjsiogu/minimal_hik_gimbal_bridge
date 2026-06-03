@@ -64,6 +64,28 @@ void read_yaml_double(const cv::FileNode & node, const char * name, double & tar
   node >> target;
 }
 
+void read_yaml_int(const cv::FileNode & node, const char * name, int & target)
+{
+  if (node.empty()) {
+    return;
+  }
+  if (!node.isInt()) {
+    throw std::runtime_error(std::string("配置项 ") + name + " 必须是整数");
+  }
+  node >> target;
+}
+
+void read_yaml_string(const cv::FileNode & node, const char * name, std::string & target)
+{
+  if (node.empty()) {
+    return;
+  }
+  if (!node.isString()) {
+    throw std::runtime_error(std::string("配置项 ") + name + " 必须是字符串");
+  }
+  node >> target;
+}
+
 void load_yaml_config(const std::string & path, Options & options)
 {
   cv::FileStorage storage(path, cv::FileStorage::READ);
@@ -76,6 +98,7 @@ void load_yaml_config(const std::string & path, Options & options)
 
   const auto camera_node = storage["camera"];
   if (!camera_node.empty()) {
+    read_yaml_string(camera_node["serial_number"], "camera.serial_number", options.camera_serial_number);
     read_yaml_double(camera_node["exposure_ms"], "camera.exposure_ms", options.exposure_ms);
     read_yaml_double(camera_node["gain"], "camera.gain", options.gain);
   }
@@ -83,6 +106,12 @@ void load_yaml_config(const std::string & path, Options & options)
   const auto image_node = storage["image"];
   if (!image_node.empty()) {
     read_yaml_rotation_matrix(image_node["rotation_matrix"], "image.rotation_matrix", options.rotation_matrix);
+    read_yaml_double(image_node["crop_center_x"], "image.crop_center_x", options.crop_center_x);
+    read_yaml_double(image_node["crop_center_y"], "image.crop_center_y", options.crop_center_y);
+    read_yaml_int(image_node["center_clear_radius"], "image.center_clear_radius", options.center_clear_radius);
+    options.crop_center_x = std::clamp(options.crop_center_x, 0.0, 1.0);
+    options.crop_center_y = std::clamp(options.crop_center_y, 0.0, 1.0);
+    options.center_clear_radius = std::max(0, options.center_clear_radius);
   }
 }
 
@@ -116,6 +145,8 @@ void print_help()
   std::cout
     << "minimal_hik_gimbal_bridge\n"
     << "  --config <path>          YAML 配置文件，默认自动尝试 config/bridge.yaml\n"
+    << "  --camera-serial <serial>绑定指定海康相机序列号，覆盖 YAML camera.serial_number\n"
+    << "  --list-cameras          枚举当前 USB 海康相机后退出\n"
     << "  --exposure-ms <value>    海康曝光时间，默认 10.0 ms\n"
     << "  --gain <value>           海康增益，默认 12.0\n"
     << "  --send-interval-ms <n>   串口发送周期，默认 20 ms，对应 0x0310 50Hz\n"
@@ -158,6 +189,9 @@ bool save_config(Options & options, std::string * error)
   }
 
   storage << "camera" << "{";
+  if (!options.camera_serial_number.empty()) {
+    storage << "serial_number" << options.camera_serial_number;
+  }
   storage << "exposure_ms" << options.exposure_ms;
   storage << "gain" << options.gain;
   storage << "}";
@@ -167,6 +201,9 @@ bool save_config(Options & options, std::string * error)
     options.rotation_matrix[2], options.rotation_matrix[3]);
   storage << "image" << "{";
   storage << "rotation_matrix" << rotation_matrix;
+  storage << "crop_center_x" << std::clamp(options.crop_center_x, 0.0, 1.0);
+  storage << "crop_center_y" << std::clamp(options.crop_center_y, 0.0, 1.0);
+  storage << "center_clear_radius" << std::max(0, options.center_clear_radius);
   storage << "}";
   storage.release();
 
@@ -195,6 +232,10 @@ Options parse_args(int argc, char ** argv)
 
     if (arg == "--config") {
       require_value("--config");
+    } else if (arg == "--camera-serial") {
+      options.camera_serial_number = require_value("--camera-serial");
+    } else if (arg == "--list-cameras") {
+      options.list_cameras = true;
     } else if (arg == "--exposure-ms") {
       options.exposure_ms = std::stod(require_value("--exposure-ms"));
     } else if (arg == "--gain") {

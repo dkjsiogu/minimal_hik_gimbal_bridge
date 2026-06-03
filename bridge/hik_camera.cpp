@@ -11,6 +11,48 @@
 namespace bridge
 {
 
+namespace
+{
+
+template <std::size_t Size>
+std::string fixed_string(const unsigned char (&bytes)[Size])
+{
+  const char * begin = reinterpret_cast<const char *>(bytes);
+  const char * end = std::find(begin, begin + Size, '\0');
+  return std::string(begin, end);
+}
+
+std::string local_hex_code(unsigned int value)
+{
+  std::ostringstream oss;
+  oss << std::hex << std::uppercase << value;
+  return oss.str();
+}
+
+HikCameraDeviceInfo describe_usb_device(const MV_CC_DEVICE_INFO * device, std::size_t index)
+{
+  HikCameraDeviceInfo info;
+  info.index = index;
+  if (device == nullptr) {
+    return info;
+  }
+
+  const auto & usb_info = device->SpecialInfo.stUsb3VInfo;
+  info.serial_number = fixed_string(usb_info.chSerialNumber);
+  info.model_name = fixed_string(usb_info.chModelName);
+  info.user_defined_name = fixed_string(usb_info.chUserDefinedName);
+  return info;
+}
+
+void throw_enum_error(int code)
+{
+  throw std::runtime_error(
+    "MV_CC_EnumDevices(MV_USB_DEVICE) 失败: 0x" + local_hex_code(static_cast<unsigned int>(code)) +
+    "；请确认运行时 LD_LIBRARY_PATH 包含完整 MVS 运行时，例如 /opt/MVS/lib/64");
+}
+
+}  // namespace
+
 HikCamera::HikCamera() = default;
 
 HikCamera::~HikCamera()
@@ -38,7 +80,7 @@ double HikCamera::gain() const
   return gain_;
 }
 
-void HikCamera::open_first(double exposure_ms, double gain)
+void HikCamera::open_first(double exposure_ms, double gain, const std::string & serial_number)
 {
   close();
 
@@ -47,16 +89,43 @@ void HikCamera::open_first(double exposure_ms, double gain)
 
   const auto ret = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
   if (ret != MV_OK) {
-    throw std::runtime_error(
-      "MV_CC_EnumDevices(MV_USB_DEVICE) 失败: 0x" + hex_code(ret) +
-      "；请确认运行时 LD_LIBRARY_PATH 包含完整 MVS 运行时，例如 /opt/MVS/lib/64");
+    throw_enum_error(ret);
   }
 
   if (device_list.nDeviceNum == 0) {
-    throw std::runtime_error("未找到海康相机");
+    if (serial_number.empty()) {
+      throw std::runtime_error("未找到海康相机");
+    }
+    throw std::runtime_error("未找到海康相机，已配置 serial_number=" + serial_number);
   }
 
-  check(MV_CC_CreateHandle(&handle_, device_list.pDeviceInfo[0]), "MV_CC_CreateHandle");
+  MV_CC_DEVICE_INFO * selected_device = nullptr;
+  for (unsigned int index = 0; index < device_list.nDeviceNum; ++index) {
+    MV_CC_DEVICE_INFO * device = device_list.pDeviceInfo[index];
+    if (device == nullptr) {
+      continue;
+    }
+    const auto info = describe_usb_device(device, index);
+    if (serial_number.empty() || info.serial_number == serial_number) {
+      selected_device = device;
+      break;
+    }
+  }
+
+  if (selected_device == nullptr) {
+    std::ostringstream oss;
+    oss << "未找到指定海康相机 serial_number=" << serial_number << "；当前 USB 海康相机:";
+    for (unsigned int index = 0; index < device_list.nDeviceNum; ++index) {
+      const auto info = describe_usb_device(device_list.pDeviceInfo[index], index);
+      oss << " [index=" << info.index
+          << " serial_number=" << (info.serial_number.empty() ? "<empty>" : info.serial_number)
+          << " model=" << (info.model_name.empty() ? "<empty>" : info.model_name)
+          << ']';
+    }
+    throw std::runtime_error(oss.str());
+  }
+
+  check(MV_CC_CreateHandle(&handle_, selected_device), "MV_CC_CreateHandle");
   try {
     check(MV_CC_OpenDevice(handle_), "MV_CC_OpenDevice");
     apply_settings_or_throw(exposure_ms, gain);
@@ -67,6 +136,27 @@ void HikCamera::open_first(double exposure_ms, double gain)
     close();
     throw;
   }
+}
+
+std::vector<HikCameraDeviceInfo> HikCamera::list_devices()
+{
+  MV_CC_DEVICE_INFO_LIST device_list;
+  std::memset(&device_list, 0, sizeof(device_list));
+
+  const auto ret = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+  if (ret != MV_OK) {
+    throw_enum_error(ret);
+  }
+
+  std::vector<HikCameraDeviceInfo> devices;
+  devices.reserve(device_list.nDeviceNum);
+  for (unsigned int index = 0; index < device_list.nDeviceNum; ++index) {
+    if (device_list.pDeviceInfo[index] == nullptr) {
+      continue;
+    }
+    devices.push_back(describe_usb_device(device_list.pDeviceInfo[index], index));
+  }
+  return devices;
 }
 
 bool HikCamera::apply_settings(double exposure_ms, double gain, std::string * error)

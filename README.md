@@ -4,7 +4,7 @@
 
 它的职责很明确：
 
-- 打开第一台海康相机
+- 按配置绑定指定海康相机；未配置时打开第一台海康相机
 - 打开图传发送端 USB-TTL 串口，默认 `/dev/ttyUSB0 @ 921600`
 - 默认生成官方裁判系统 `0x0310` 帧并直接写入图传发送端
 
@@ -87,6 +87,7 @@ cmake -S . -B build -DHIKROBOT_SDK_DIR=/your/hikrobot
 
 ```yaml
 camera:
+  serial_number: "DA0000000"
   exposure_ms: 10.0
   gain: 12.0
 image:
@@ -95,6 +96,8 @@ image:
     cols: 2
     dt: d
     data: [ 1., 0., 0., 1. ]
+  crop_center_x: 0.5
+  crop_center_y: 0.5
 ```
 
 如果你想用别的文件，运行时加：
@@ -103,9 +106,21 @@ image:
 ./build/minimal_hik_gimbal_bridge --config /path/to/bridge.yaml
 ```
 
+如果现场会同时插多台海康 USB 相机，先只插目标相机，运行：
+
+```bash
+./scripts/run-bridge.sh --list-cameras
+```
+
+把输出里的 `serial_number` 写入 `camera.serial_number`，之后程序会固定打开这台相机。也可以临时用命令行覆盖：
+
+```bash
+./scripts/run-bridge.sh --camera-serial DA0000000
+```
+
 旋转矩阵只从 YAML 读取；命令行参数仍然只覆盖 `--exposure-ms` 和 `--gain`。
 
-如果你开了 `--preview`，按 `S` 会把当前曝光、增益以及当前旋转矩阵一起保存回 YAML。
+如果你开了 `--preview`，可以在预览窗口里直接拖动 ROI 方框，选择实际发送出去的画面区域；按 `S` 会把当前曝光、增益、旋转矩阵和 ROI 中心一起保存回 YAML。
 
 ## 编译
 
@@ -228,6 +243,8 @@ tail -f logs/bridge-autostart.log
 - `--video-serial <path>`：直连图传发送端的 USB-TTL 串口路径，默认 `/dev/ttyUSB0`
 - `--video-serial-baud <rate>`：图传发送端串口波特率，默认 `921600`
 - `--config <path>`：YAML 配置文件，默认自动尝试 `config/bridge.yaml`
+- `--camera-serial <serial>`：绑定指定海康相机序列号，覆盖 YAML `camera.serial_number`
+- `--list-cameras`：列出当前 USB 海康相机后退出
 - `--preview`：显示海康原画，并在窗口里直接调曝光和增益
 - `--ffmpeg <path>`：ffmpeg 路径
 - `--video-size <n>`：输出边长，默认 `300`

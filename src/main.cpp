@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <chrono>
 #include <csignal>
 #include <iomanip>
@@ -25,6 +26,58 @@ namespace
 {
 
 std::atomic_bool g_running = true;
+
+struct AnnexBStartCode
+{
+  std::size_t offset = 0;
+  std::size_t bytes = 0;
+};
+
+bool find_annexb_start_code(
+  const uint8_t * buffer,
+  std::size_t size,
+  std::size_t from,
+  AnnexBStartCode & start_code)
+{
+  if (buffer == nullptr || size < 3 || from >= size) {
+    return false;
+  }
+
+  for (std::size_t i = from; i + 2 < size; ++i) {
+    if (buffer[i] != 0 || buffer[i + 1] != 0) {
+      continue;
+    }
+    if (buffer[i + 2] == 1) {
+      start_code.offset = i;
+      start_code.bytes = 3;
+      return true;
+    }
+    if (i + 3 < size && buffer[i + 2] == 0 && buffer[i + 3] == 1) {
+      start_code.offset = i;
+      start_code.bytes = 4;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool chunk_contains_resync_nal(const uint8_t * buffer, std::size_t size)
+{
+  AnnexBStartCode start_code{};
+  std::size_t search_from = 0;
+  while (find_annexb_start_code(buffer, size, search_from, start_code)) {
+    const auto nal_header_index = start_code.offset + start_code.bytes;
+    if (nal_header_index < size) {
+      const auto nal_type = static_cast<uint8_t>(buffer[nal_header_index] & 0x1FU);
+      if (nal_type == 5U || nal_type == 7U || nal_type == 8U) {
+        return true;
+      }
+    }
+    search_from = start_code.offset + start_code.bytes;
+  }
+  return false;
+}
 
 void on_signal(int)
 {
@@ -43,11 +96,28 @@ int main(int argc, char ** argv)
     std::signal(SIGPIPE, SIG_IGN);
 
     bridge::Options options = bridge::parse_args(argc, argv);
+    if (options.list_cameras) {
+      const auto devices = bridge::HikCamera::list_devices();
+      if (devices.empty()) {
+        std::cout << "[bridge] no Hik USB cameras found." << std::endl;
+      }
+      for (const auto & device : devices) {
+        std::cout << "[bridge] camera index=" << device.index
+                  << " serial_number=" << (device.serial_number.empty() ? "<empty>" : device.serial_number)
+                  << " model=" << (device.model_name.empty() ? "<empty>" : device.model_name)
+                  << " user_defined_name=" << (device.user_defined_name.empty() ? "<empty>" : device.user_defined_name)
+                  << std::endl;
+      }
+      return 0;
+    }
+
     bridge::CameraPreviewWindow preview(options);
 
     if (!options.config_path.empty()) {
       std::cout << "[bridge] loaded config: " << options.config_path
                 << " exposure_ms=" << options.exposure_ms
+                << " camera_serial_number=" << (options.camera_serial_number.empty() ? "<first>" : options.camera_serial_number)
+                << " crop_center=(" << options.crop_center_x << ',' << options.crop_center_y << ')'
                 << " gain=" << options.gain
                 << " rotation_matrix=[[" << options.rotation_matrix[0] << ',' << options.rotation_matrix[1]
                 << "],[" << options.rotation_matrix[2] << ',' << options.rotation_matrix[3] << "]]"
@@ -59,6 +129,9 @@ int main(int argc, char ** argv)
       std::cout << "[bridge] using built-in test pattern source." << std::endl;
     } else {
       std::cout << "[bridge] Hik camera reconnect loop enabled." << std::endl;
+      if (!options.camera_serial_number.empty()) {
+        std::cout << "[bridge] binding Hik camera serial_number=" << options.camera_serial_number << std::endl;
+      }
     }
     if (preview.enabled()) {
       std::cout << "[bridge] raw preview enabled; adjust exposure/gain in the preview window, press S to save YAML." << std::endl;
@@ -82,26 +155,20 @@ int main(int argc, char ** argv)
     bridge::FrameInfo latest_frame{};
     bridge::FramePreprocessor preprocessor(options);
     bridge::H264EncoderProcess video_encoder;
-    uint32_t video_sequence = 0;
-    bool video_reset = true;
-    auto video_stream_start = bridge::Clock::now();
+    std::atomic_uint32_t video_sequence = 0;
+    std::atomic_bool video_reset_pending = true;
     auto last_video_submit = bridge::Clock::time_point{};
-    uint32_t sent_packets = 0;
+    std::atomic_uint32_t sent_packets = 0;
     uint32_t frames_in_window = 0;
     double fps = 0.0;
-    auto last_send = bridge::Clock::now();
     auto last_report = bridge::Clock::now();
     auto fps_window = bridge::Clock::now();
     auto last_test_frame = bridge::Clock::time_point{};
     uint32_t test_pattern_sequence = 0;
     auto next_camera_retry = bridge::Clock::time_point{};
-    auto next_video_serial_retry = bridge::Clock::time_point{};
     bridge::Clock::time_point last_camera_open_error{};
     bridge::Clock::time_point last_camera_runtime_error{};
-    bridge::Clock::time_point last_video_serial_open_error{};
-    bridge::Clock::time_point last_video_serial_write_error{};
-
-    uint8_t video_serial_seq = 0;
+    std::atomic_uint32_t video_serial_seq = 0;
 
     const auto maybe_open_camera = [&](bridge::Clock::time_point now) {
       if (options.test_pattern || camera.is_open() || now < next_camera_retry) {
@@ -109,32 +176,13 @@ int main(int argc, char ** argv)
       }
 
       try {
-        camera.open_first(options.exposure_ms, options.gain);
+        camera.open_first(options.exposure_ms, options.gain, options.camera_serial_number);
         std::cout << "[bridge] Hik camera ready. exposure_ms=" << options.exposure_ms
                   << " gain=" << options.gain << std::endl;
       } catch (const std::exception & error) {
         next_camera_retry = now + bridge::kDeviceReconnectInterval;
         if (bridge::should_log_at_interval(now, last_camera_open_error, bridge::kReconnectLogInterval)) {
           std::cerr << "[bridge] Hik camera reconnect failed: " << error.what() << std::endl;
-        }
-      }
-    };
-
-    const auto maybe_open_video_serial = [&](bridge::Clock::time_point now) {
-      if (options.video_serial.empty() ||
-          video_serial.is_open() ||
-          now < next_video_serial_retry) {
-        return;
-      }
-
-      try {
-        video_serial.open_or_throw(options.video_serial, options.video_serial_baud);
-        std::cout << "[bridge] 0x0310 video serial ready: " << options.video_serial
-                  << " baud=" << options.video_serial_baud << std::endl;
-      } catch (const std::exception & error) {
-        next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
-        if (bridge::should_log_at_interval(now, last_video_serial_open_error, bridge::kReconnectLogInterval)) {
-          std::cerr << "[bridge] 0x0310 video serial reconnect failed: " << error.what() << std::endl;
         }
       }
     };
@@ -149,10 +197,85 @@ int main(int argc, char ** argv)
               << " mono=" << (options.force_monochrome ? "on" : "off")
               << std::endl;
 
+    const auto send_interval = std::chrono::milliseconds(options.send_interval_ms);
+    std::thread sender_thread([&]() {
+      auto next_send = bridge::Clock::now() + send_interval;
+      auto next_video_serial_retry = bridge::Clock::time_point{};
+      bridge::Clock::time_point last_video_serial_open_error{};
+      bridge::Clock::time_point last_video_serial_write_error{};
+
+      while (g_running.load()) {
+        const auto now = bridge::Clock::now();
+        if (now < next_send) {
+          std::this_thread::sleep_until(next_send);
+          continue;
+        }
+        while (next_send <= now) {
+          next_send += send_interval;
+        }
+
+        if (!options.video_serial.empty() && !video_serial.is_open() && now >= next_video_serial_retry) {
+          try {
+            video_serial.open_or_throw(options.video_serial, options.video_serial_baud);
+            std::cout << "[bridge] 0x0310 video serial ready: " << options.video_serial
+                      << " baud=" << options.video_serial_baud << std::endl;
+          } catch (const std::exception & error) {
+            next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
+            if (bridge::should_log_at_interval(now, last_video_serial_open_error, bridge::kReconnectLogInterval)) {
+              std::cerr << "[bridge] 0x0310 video serial reconnect failed: " << error.what() << std::endl;
+            }
+          }
+        }
+
+        std::array<uint8_t, bridge::protocol::kCustomClientVideo0310PayloadBytes> video_chunk{};
+        std::size_t video_chunk_size = 0;
+        const bool packet_ready = video_encoder.pop_chunk(video_chunk, video_chunk_size);
+        if (!packet_ready) {
+          continue;
+        }
+
+        const bool has_resync_nal = chunk_contains_resync_nal(video_chunk.data(), video_chunk_size);
+        const bool mark_reset = video_reset_pending.load() || has_resync_nal;
+
+        bridge::protocol::CustomClientVideo0310Chunk packet{};
+        bridge::protocol::fill_custom_client_0310_video_chunk(
+          packet,
+          mark_reset ? bridge::protocol::kCustomClientVideo0310FlagReset : 0U,
+          static_cast<uint8_t>(video_sequence.fetch_add(1)),
+          video_chunk.data(),
+          video_chunk_size);
+
+        if (video_serial.is_open()) {
+          try {
+            uint8_t ref_frame[320];
+            std::size_t ref_len = 0;
+            bridge::protocol::build_referee_frame(
+              ref_frame, ref_len,
+              bridge::protocol::kCustomClient0310CmdId,
+              static_cast<uint8_t>(video_serial_seq.fetch_add(1)),
+              reinterpret_cast<const uint8_t *>(&packet),
+              sizeof(packet));
+            video_serial.write_all(ref_frame, ref_len);
+          } catch (const std::exception & error) {
+            video_serial.close();
+            next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
+            if (bridge::should_log_at_interval(now, last_video_serial_write_error, bridge::kReconnectLogInterval)) {
+              std::cerr << "[video-serial] write error, retrying: " << error.what() << std::endl;
+            }
+          }
+        }
+        viewer_udp.send(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+        sent_packets.fetch_add(1);
+        if (mark_reset && has_resync_nal) {
+          video_reset_pending = false;
+        }
+      }
+    });
+
     while (g_running.load()) {
       const auto now = bridge::Clock::now();
       maybe_open_camera(now);
-      maybe_open_video_serial(now);
+      preprocessor.sync_runtime_options(options);
 
       bridge::FrameInfo frame{};
       bool have_frame = false;
@@ -190,8 +313,7 @@ int main(int argc, char ** argv)
               static_cast<uint16_t>(preprocessor.output_size()),
               options);
             video_sequence = 0;
-            video_reset = true;
-            video_stream_start = now;
+            video_reset_pending = true;
             last_video_submit = bridge::Clock::time_point{};
           }
 
@@ -214,8 +336,7 @@ int main(int argc, char ** argv)
                 static_cast<uint16_t>(preprocessor.output_size()),
                 options);
               video_sequence = 0;
-              video_reset = true;
-              video_stream_start = now;
+              video_reset_pending = true;
             }
             last_video_submit = now;
           }
@@ -233,62 +354,24 @@ int main(int argc, char ** argv)
         fps_window = now;
       }
 
-      if (now - last_send >= std::chrono::milliseconds(options.send_interval_ms)) {
-        std::array<uint8_t, bridge::protocol::kCustomClientVideo0310PayloadBytes> video_chunk{};
-        std::size_t video_chunk_size = 0;
-        const bool packet_ready = video_encoder.pop_chunk(video_chunk, video_chunk_size);
-
-        if (packet_ready) {
-          bridge::protocol::CustomClientVideo0310Chunk packet{};
-          const auto flags = video_reset ? 1U : 0U;
-          video_reset = false;
-          bridge::protocol::fill_custom_client_0310_video_chunk(
-            packet,
-            static_cast<uint8_t>(flags),
-            static_cast<uint8_t>(video_sequence++),
-            video_chunk.data(),
-            video_chunk_size);
-
-          if (video_serial.is_open()) {
-            try {
-              uint8_t ref_frame[320];
-              std::size_t ref_len = 0;
-              bridge::protocol::build_referee_frame(
-                ref_frame, ref_len,
-                bridge::protocol::kCustomClient0310CmdId,
-                video_serial_seq++,
-                reinterpret_cast<const uint8_t *>(&packet),
-                sizeof(packet));
-              video_serial.write_all(ref_frame, ref_len);
-            } catch (const std::exception & error) {
-              video_serial.close();
-              next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
-              if (bridge::should_log_at_interval(now, last_video_serial_write_error, bridge::kReconnectLogInterval)) {
-                std::cerr << "[video-serial] write error, retrying: " << error.what() << std::endl;
-              }
-            }
-          }
-          viewer_udp.send(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
-          ++sent_packets;
-          last_send = now;
-        }
-      }
-
       if (now - last_report >= std::chrono::seconds(1)) {
         std::cout << "[bridge] frame_seq=" << latest_frame.sequence
                   << " resolution=" << latest_frame.width << 'x' << latest_frame.height
                   << " camera=" << (options.test_pattern ? "test" : (camera.is_open() ? "online" : "reconnecting"))
                   << " fps=" << std::fixed << std::setprecision(1) << fps
-                  << " sent=" << sent_packets
+                  << " sent=" << sent_packets.load()
                   << " video_tx=" << (video_serial.is_open() ? "online" : "reconnecting")
                   << " video_backlog=" << video_encoder.queued_bytes()
-                  << " video_seq=" << video_sequence;
+                  << " video_seq=" << video_sequence.load();
         std::cout << std::endl;
         last_report = now;
       }
     }
 
     g_running = false;
+    if (sender_thread.joinable()) {
+      sender_thread.join();
+    }
     return 0;
   } catch (const std::exception & error) {
     g_running = false;

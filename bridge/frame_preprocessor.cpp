@@ -18,13 +18,27 @@ cv::Mat apply_rotation_matrix_bgr(const cv::Mat & input_bgr, const std::array<do
     return {};
   }
 
-  const bool is_identity =
-    std::fabs(matrix[0] - 1.0) < 1e-9 &&
-    std::fabs(matrix[1]) < 1e-9 &&
-    std::fabs(matrix[2]) < 1e-9 &&
-    std::fabs(matrix[3] - 1.0) < 1e-9;
-  if (is_identity) {
-    return input_bgr;
+  switch (classify_right_angle_rotation(matrix)) {
+    case RightAngleRotation::kIdentity:
+      return input_bgr;
+    case RightAngleRotation::kRotate90CounterClockwise: {
+      cv::Mat rotated;
+      cv::rotate(input_bgr, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+      return rotated;
+    }
+    case RightAngleRotation::kRotate90Clockwise: {
+      cv::Mat rotated;
+      cv::rotate(input_bgr, rotated, cv::ROTATE_90_CLOCKWISE);
+      return rotated;
+    }
+    case RightAngleRotation::kRotate180: {
+      cv::Mat rotated;
+      cv::rotate(input_bgr, rotated, cv::ROTATE_180);
+      return rotated;
+    }
+    case RightAngleRotation::kUnsupported:
+    default:
+      break;
   }
 
   const double cx = (static_cast<double>(input_bgr.cols) - 1.0) * 0.5;
@@ -50,6 +64,8 @@ cv::Mat apply_rotation_matrix_bgr(const cv::Mat & input_bgr, const std::array<do
 FramePreprocessor::FramePreprocessor(const Options & options)
 : rotation_matrix_(options.rotation_matrix),
   crop_size_(std::max(0, options.crop_size)),
+  crop_center_x_(std::clamp(options.crop_center_x, 0.0, 1.0)),
+  crop_center_y_(std::clamp(options.crop_center_y, 0.0, 1.0)),
   output_size_(std::clamp(options.video_size, 120, 480)),
   target_bitrate_kbps_(options.video_bitrate_kbps),
   static_simplify_(options.static_simplify),
@@ -71,6 +87,29 @@ int FramePreprocessor::output_size() const
   return output_size_;
 }
 
+void FramePreprocessor::sync_runtime_options(const Options & options)
+{
+  const auto next_rotation = options.rotation_matrix;
+  const int next_crop_size = std::max(0, options.crop_size);
+  const double next_crop_center_x = std::clamp(options.crop_center_x, 0.0, 1.0);
+  const double next_crop_center_y = std::clamp(options.crop_center_y, 0.0, 1.0);
+
+  const bool crop_changed =
+    crop_size_ != next_crop_size ||
+    std::fabs(crop_center_x_ - next_crop_center_x) >= 1e-6 ||
+    std::fabs(crop_center_y_ - next_crop_center_y) >= 1e-6 ||
+    rotation_matrix_ != next_rotation;
+
+  rotation_matrix_ = next_rotation;
+  crop_size_ = next_crop_size;
+  crop_center_x_ = next_crop_center_x;
+  crop_center_y_ = next_crop_center_y;
+
+  if (crop_changed) {
+    reset_history();
+  }
+}
+
 cv::Mat FramePreprocessor::process_rgb24(const FrameInfo & frame)
 {
   if (frame.rgb24.empty() || frame.width == 0 || frame.height == 0) {
@@ -86,12 +125,12 @@ cv::Mat FramePreprocessor::process_rgb24(const FrameInfo & frame)
   cv::cvtColor(input_rgb, input_bgr, cv::COLOR_RGB2BGR);
   cv::Mat rotated_bgr = apply_rotation_matrix_bgr(input_bgr, rotation_matrix_);
 
-  const int crop_edge = crop_size_ > 0
-    ? std::min({crop_size_, rotated_bgr.cols, rotated_bgr.rows})
-    : std::min(rotated_bgr.cols, rotated_bgr.rows);
-  const int x0 = std::max(0, (rotated_bgr.cols - crop_edge) / 2);
-  const int y0 = std::max(0, (rotated_bgr.rows - crop_edge) / 2);
-  cv::Mat cropped = rotated_bgr(cv::Rect(x0, y0, crop_edge, crop_edge));
+  const auto crop_region = compute_square_crop_region(
+    rotated_bgr.size(), crop_size_, crop_center_x_, crop_center_y_);
+  if (crop_region.rect.width <= 0 || crop_region.rect.height <= 0) {
+    return {};
+  }
+  cv::Mat cropped = rotated_bgr(crop_region.rect);
 
   cv::Mat resized;
   cv::resize(cropped, resized, cv::Size(output_size_, output_size_), 0, 0, cv::INTER_LINEAR);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bridge/crop_region.hpp"
 #include "bridge/frame.hpp"
 #include "bridge/options.hpp"
 
@@ -16,6 +17,7 @@ public:
   explicit FramePreprocessor(const Options & options);
 
   int output_size() const;
+  void sync_runtime_options(const Options & options);
   cv::Mat process_rgb24(const FrameInfo & frame);
 
 private:
@@ -24,6 +26,8 @@ private:
 
   std::array<double, 4> rotation_matrix_ = {1.0, 0.0, 0.0, 1.0};
   int crop_size_ = 0;
+  double crop_center_x_ = 0.5;
+  double crop_center_y_ = 0.5;
   int output_size_ = 300;
   int target_bitrate_kbps_ = 88;
   bool static_simplify_ = true;

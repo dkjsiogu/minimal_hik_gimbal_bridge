@@ -1,11 +1,15 @@
 %YAML:1.0
 ---
 camera:
-   exposure_ms: 6.8500000000000000e+01
-   gain: 1.4800000000000001e+01
+   serial_number: DA9905404
+   exposure_ms: 6.7599999999999994e+01
+   gain: 1.1300000000000001e+01
 image:
    rotation_matrix: !!opencv-matrix
       rows: 2
       cols: 2
       dt: d
-      data: [ 0., -1., 1., 0. ]
+      data: [ 0., 1., -1., 0. ]
+   crop_center_x: 1.
+   crop_center_y: 1.
+   center_clear_radius: 0

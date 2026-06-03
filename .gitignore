@@ -4,3 +4,4 @@ MvSdkLog/
 $(ALLUSERSPROFILE)/
 *.log
 .DS_Store
+.vscode/
